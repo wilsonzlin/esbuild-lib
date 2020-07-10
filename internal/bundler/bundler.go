@@ -58,18 +58,17 @@ type parseFlags struct {
 }
 
 type parseArgs struct {
-	fs           fs.FS
-	log          logging.Log
-	res          resolver.Resolver
-	keyPath      ast.Path
-	prettyPath   string
-	baseName     string
-	sourceIndex  uint32
-	importSource *logging.Source
-	flags        parseFlags
-	pathRange    ast.Range
-	options      config.Options
-	results      chan parseResult
+	fs              fs.FS
+	log             logging.Log
+	res             resolver.Resolver
+	keyPath         ast.Path
+	prettyPath      string
+	sourceIndex     uint32
+	importSource    *logging.Source
+	flags           parseFlags
+	importPathRange ast.Range
+	options         config.Options
+	results         chan parseResult
 
 	// If non-empty, this provides a fallback directory to resolve imports
 	// against for virtual source files (i.e. those with no file system path).
@@ -87,48 +86,38 @@ type parseResult struct {
 
 func parseFile(args parseArgs) {
 	source := logging.Source{
-		Index:      args.sourceIndex,
-		KeyPath:    args.keyPath,
-		PrettyPath: args.prettyPath,
-	}
-
-	// Try to determine the identifier name by the absolute path, since it may
-	// need to look at the parent directory. But make sure to not treat the key
-	// as a file system path if it's not marked as one.
-	if args.keyPath.IsAbsolute {
-		source.IdentifierName = ast.GenerateNonUniqueNameFromPath(args.keyPath.Text)
-	} else {
-		source.IdentifierName = ast.GenerateNonUniqueNameFromPath(args.baseName)
+		Index:          args.sourceIndex,
+		KeyPath:        args.keyPath,
+		PrettyPath:     args.prettyPath,
+		IdentifierName: ast.GenerateNonUniqueNameFromPath(args.keyPath.Text),
 	}
 
 	var loader config.Loader
-	stdin := args.options.Stdin
 
-	if stdin != nil {
+	if stdin := args.options.Stdin; stdin != nil {
 		// Special-case stdin
 		source.Contents = stdin.Contents
-		source.PrettyPath = "<stdin>"
 		if stdin.SourceFile != "" {
 			source.PrettyPath = stdin.SourceFile
 		}
 		loader = stdin.Loader
-	} else if args.keyPath.IsAbsolute {
-		// Read normal modules from disk
+		if loader == config.LoaderNone {
+			loader = config.LoaderJS
+		}
+	} else {
 		var ok bool
-		source.Contents, ok = args.res.Read(args.keyPath.Text)
+		loader, ok = runLoaderPlugins(
+			args.options.LoaderPlugins,
+			args.res,
+			args.log,
+			&source,
+			args.importSource,
+			args.importPathRange,
+		)
 		if !ok {
-			args.log.AddRangeError(args.importSource, args.pathRange,
-				fmt.Sprintf("Could not read from file: %s", args.keyPath.Text))
 			args.results <- parseResult{}
 			return
 		}
-		loader = loaderFromFileExtension(args.options.ExtensionToLoader, args.baseName)
-	} else {
-		// Right now the only non-absolute modules are disabled ones
-		if !strings.HasPrefix(args.keyPath.Text, "disabled:") {
-			panic("Internal error")
-		}
-		loader = config.LoaderJS
 	}
 
 	// Allow certain properties to be overridden
@@ -148,6 +137,12 @@ func parseFile(args parseArgs) {
 			ignoreIfUnused: args.flags.ignoreIfUnused,
 		},
 		ok: true,
+	}
+
+	// The special "default" loader determines the loader from the file path
+	baseName := args.fs.Base(args.keyPath.Text)
+	if loader == config.LoaderDefault {
+		loader = loaderFromFileExtension(args.options.ExtensionToLoader, baseName)
 	}
 
 	switch loader {
@@ -191,7 +186,7 @@ func parseFile(args parseArgs) {
 		result.file.ignoreIfUnused = true
 
 	case config.LoaderDataURL:
-		mimeType := mime.TypeByExtension(args.fs.Ext(args.baseName))
+		mimeType := mime.TypeByExtension(args.fs.Ext(baseName))
 		if mimeType == "" {
 			mimeType = http.DetectContentType([]byte(source.Contents))
 		}
@@ -205,7 +200,7 @@ func parseFile(args parseArgs) {
 		// Add a hash to the file name to prevent multiple files with the same base
 		// name from colliding. Avoid using the absolute path to prevent build
 		// output from being different on different machines.
-		baseName := baseNameForAvoidingCollisions(args.fs, args.keyPath, args.baseName)
+		baseName = baseNameForAvoidingCollisions(args.fs, args.keyPath, baseName)
 
 		// Determine the destination folder
 		targetFolder := args.options.AbsOutputDir
@@ -232,8 +227,8 @@ func parseFile(args parseArgs) {
 
 	default:
 		result.ok = false
-		args.log.AddRangeError(args.importSource, args.pathRange,
-			fmt.Sprintf("File extension not supported: %s", args.prettyPath))
+		args.log.AddRangeError(args.importSource, args.importPathRange,
+			fmt.Sprintf("File could not be loaded: %s", source.PrettyPath))
 	}
 
 	// Run the resolver on the parse thread so it's not run on the main thread.
@@ -243,17 +238,6 @@ func parseFile(args parseArgs) {
 
 		if len(result.file.ast.ImportRecords) > 0 {
 			cache := make(map[string]*resolver.ResolveResult)
-
-			// Resolve relative to the parent directory of the source file with the
-			// import path. Just use the current directory if the source file is virtual.
-			var sourceDir string
-			if source.KeyPath.IsAbsolute {
-				sourceDir = args.fs.Dir(source.KeyPath.Text)
-			} else if args.absResolveDir != "" {
-				sourceDir = args.absResolveDir
-			} else {
-				sourceDir = args.fs.Cwd()
-			}
 
 			for _, part := range result.file.ast.Parts {
 				for _, importRecordIndex := range part.ImportRecordIndices {
@@ -270,7 +254,17 @@ func parseFile(args parseArgs) {
 					}
 
 					// Run the resolver and log an error if the path couldn't be resolved
-					resolveResult := args.res.Resolve(sourceDir, record.Path.Text)
+					pathRange := source.RangeOfString(record.Loc)
+					resolveResult, didLogError := runResolverPlugins(
+						args.options.ResolverPlugins,
+						args.res,
+						args.log,
+						args.fs,
+						&source,
+						pathRange,
+						record.Path.Text,
+						args.absResolveDir,
+					)
 					cache[record.Path.Text] = resolveResult
 
 					if resolveResult == nil {
@@ -278,9 +272,8 @@ func parseFile(args parseArgs) {
 						// external imports instead of causing errors. This matches a common
 						// code pattern for conditionally importing a module with a graceful
 						// fallback.
-						if !record.IsInsideTryBody {
-							r := source.RangeOfString(record.Loc)
-							args.log.AddRangeError(&source, r, fmt.Sprintf("Could not resolve %q", record.Path.Text))
+						if !didLogError && !record.IsInsideTryBody {
+							args.log.AddRangeError(&source, pathRange, fmt.Sprintf("Could not resolve %q", record.Path.Text))
 						}
 						continue
 					}
@@ -292,6 +285,187 @@ func parseFile(args parseArgs) {
 	}
 
 	args.results <- result
+}
+
+func logPluginMessages(
+	res resolver.Resolver,
+	log logging.Log,
+	name string,
+	msgs []logging.Msg,
+	thrown error,
+	importSource *logging.Source,
+	importPathRange ast.Range,
+) bool {
+	didLogError := false
+
+	// Report errors and warnings generated by the plugin
+	for _, msg := range msgs {
+		if name != "" {
+			msg.Text = fmt.Sprintf("[%s] %s", name, msg.Text)
+		}
+		if msg.Kind == logging.Error {
+			didLogError = true
+		}
+
+		// Sanitize the location
+		if msg.Location != nil {
+			clone := *msg.Location
+			if clone.Namespace == "" {
+				clone.Namespace = "file"
+			}
+			if clone.File == "" {
+				clone.File = importSource.PrettyPath
+			} else {
+				clone.File = res.PrettyPath(ast.Path{Text: clone.File, Namespace: clone.Namespace})
+			}
+			if clone.Line < 0 {
+				clone.Line = 0
+			}
+			if clone.Column < 0 {
+				clone.Column = 0
+			}
+			if clone.Length < 0 {
+				clone.Length = 0
+			}
+			msg.Location = &clone
+		} else {
+			msg.Location = logging.LocationOrNil(importSource, importPathRange)
+		}
+
+		log.AddMsg(msg)
+	}
+
+	// Report errors thrown by the plugin itself
+	if thrown != nil {
+		didLogError = true
+		text := thrown.Error()
+		if name != "" {
+			text = fmt.Sprintf("[%s] %s", name, text)
+		}
+		log.AddRangeError(importSource, importPathRange, text)
+	}
+
+	return didLogError
+}
+
+func runResolverPlugins(
+	plugins []config.ResolverPlugin,
+	res resolver.Resolver,
+	log logging.Log,
+	fs fs.FS,
+	importSource *logging.Source,
+	importPathRange ast.Range,
+	path string,
+	absResolveDir string,
+) (*resolver.ResolveResult, bool) {
+	// Resolve relative to the parent directory of the source file with the
+	// import path. Just use the current directory if the source file is virtual.
+	var importDir string
+	if importSource.KeyPath.Namespace == "file" {
+		importDir = fs.Dir(importSource.KeyPath.Text)
+	} else if absResolveDir != "" {
+		importDir = absResolveDir
+	} else {
+		importDir = fs.Cwd()
+	}
+
+	resolverArgs := config.ResolverArgs{
+		Path:      path,
+		ImportDir: importDir,
+	}
+
+	// Apply resolver plugins in order until one succeeds
+	for _, plugin := range plugins {
+		if !plugin.Filter.MatchString(path) {
+			continue
+		}
+
+		result := plugin.Callback(resolverArgs)
+		didLogError := logPluginMessages(res, log, plugin.Name, result.Msgs, result.ThrownError, importSource, importPathRange)
+
+		// Stop now if there was an error
+		if didLogError {
+			return nil, true
+		}
+
+		// Otherwise, continue on to the next resolver if this loader didn't succeed
+		if result.Path.Text == "" {
+			if result.External {
+				result.Path = ast.Path{Text: path}
+			} else {
+				continue
+			}
+		}
+
+		return &resolver.ResolveResult{
+			Path:       result.Path,
+			IsExternal: result.External,
+		}, false
+	}
+
+	return res.Resolve(importDir, path), false
+}
+
+func runLoaderPlugins(
+	plugins []config.LoaderPlugin,
+	res resolver.Resolver,
+	log logging.Log,
+	source *logging.Source,
+	importSource *logging.Source,
+	importPathRange ast.Range,
+) (config.Loader, bool) {
+	loaderArgs := config.LoaderArgs{Path: source.KeyPath}
+
+	// Apply loader plugins in order until one succeeds
+	for _, plugin := range plugins {
+		if source.KeyPath.Namespace != plugin.Namespace {
+			continue
+		}
+
+		if !plugin.Filter.MatchString(source.KeyPath.Text) {
+			continue
+		}
+
+		result := plugin.Callback(loaderArgs)
+		didLogError := logPluginMessages(res, log, plugin.Name, result.Msgs, result.ThrownError, importSource, importPathRange)
+
+		// Stop now if there was an error
+		if didLogError {
+			return config.LoaderNone, false
+		}
+
+		// Otherwise, continue on to the next loader if this loader didn't succeed
+		if result.Contents == nil {
+			continue
+		}
+
+		source.Contents = *result.Contents
+		loader := result.Loader
+		if loader == config.LoaderNone {
+			loader = config.LoaderJS
+		}
+		return loader, true
+	}
+
+	// Read normal modules from disk
+	if source.KeyPath.Namespace == "file" {
+		if contents, ok := res.Read(source.KeyPath.Text); ok {
+			source.Contents = contents
+			return config.LoaderDefault, true
+		} else {
+			log.AddRangeError(importSource, importPathRange,
+				fmt.Sprintf("Could not read from file: %s", source.KeyPath.Text))
+			return config.LoaderNone, false
+		}
+	}
+
+	// Force disabled modules to be empty
+	if source.KeyPath.Namespace == resolver.BrowserFalseNamespace {
+		return config.LoaderJS, true
+	}
+
+	// Otherwise, fail to load the path
+	return config.LoaderNone, true
 }
 
 func loaderFromFileExtension(extensionToLoader map[string]config.Loader, base string) config.Loader {
@@ -320,7 +494,7 @@ func lowerCaseAbsPathForWindows(absPath string) string {
 
 func baseNameForAvoidingCollisions(fs fs.FS, keyPath ast.Path, base string) string {
 	var toHash []byte
-	if keyPath.IsAbsolute {
+	if keyPath.Namespace == "file" {
 		if relPath, ok := fs.Rel(fs.Cwd(), keyPath.Text); ok {
 			// Attempt to generate the same base name regardless of what machine or
 			// operating system we're on. We want to avoid absolute paths because they
@@ -378,12 +552,12 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 		resolveResult resolver.ResolveResult,
 		prettyPath string,
 		importSource *logging.Source,
-		pathRange ast.Range,
+		importPathRange ast.Range,
 		absResolveDir string,
 		kind inputKind,
 	) uint32 {
 		visitedKey := resolveResult.Path.Text
-		if resolveResult.Path.IsAbsolute {
+		if resolveResult.Path.Namespace == "file" {
 			visitedKey = lowerCaseAbsPathForWindows(visitedKey)
 		}
 		sourceIndex, ok := visited[visitedKey]
@@ -405,19 +579,18 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 				optionsClone.Stdin = nil
 			}
 			go parseFile(parseArgs{
-				fs:            fs,
-				log:           log,
-				res:           res,
-				keyPath:       resolveResult.Path,
-				prettyPath:    prettyPath,
-				baseName:      fs.Base(resolveResult.Path.Text),
-				sourceIndex:   sourceIndex,
-				importSource:  importSource,
-				flags:         flags,
-				pathRange:     pathRange,
-				options:       optionsClone,
-				results:       results,
-				absResolveDir: absResolveDir,
+				fs:              fs,
+				log:             log,
+				res:             res,
+				keyPath:         resolveResult.Path,
+				prettyPath:      prettyPath,
+				sourceIndex:     sourceIndex,
+				importSource:    importSource,
+				flags:           flags,
+				importPathRange: importPathRange,
+				options:         optionsClone,
+				results:         results,
+				absResolveDir:   absResolveDir,
 			})
 		}
 		return sourceIndex
@@ -435,7 +608,7 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 
 	// Add any remaining entry points
 	for _, absPath := range entryPaths {
-		prettyPath := res.PrettyPath(absPath)
+		prettyPath := res.PrettyPath(ast.Path{Text: absPath, Namespace: "file"})
 		lowerAbsPath := lowerCaseAbsPathForWindows(absPath)
 
 		if duplicateEntryPoints[lowerAbsPath] {
@@ -444,7 +617,7 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 		}
 
 		duplicateEntryPoints[lowerAbsPath] = true
-		resolveResult := res.ResolveAbs(absPath)
+		resolveResult := res.Resolve("", absPath)
 
 		if resolveResult == nil {
 			log.AddError(nil, ast.Loc{}, "Could not resolve: "+prettyPath)
@@ -486,10 +659,7 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 
 					if !resolveResult.IsExternal {
 						// Handle a path within the bundle
-						prettyPath := resolveResult.Path.Text
-						if resolveResult.Path.IsAbsolute {
-							prettyPath = res.PrettyPath(prettyPath)
-						}
+						prettyPath := res.PrettyPath(resolveResult.Path)
 						pathRange := source.RangeOfString(record.Loc)
 						sourceIndex := maybeParseFile(*resolveResult, prettyPath, &source, pathRange, "", inputKindNormal)
 						record.SourceIndex = &sourceIndex
@@ -508,7 +678,7 @@ func ScanBundle(log logging.Log, fs fs.FS, res resolver.Resolver, entryPaths []s
 					} else {
 						// If the path to the external module is relative to the source
 						// file, rewrite the path to be relative to the working directory
-						if resolveResult.Path.IsAbsolute {
+						if resolveResult.Path.Namespace == "file" {
 							if relPath, ok := fs.Rel(options.AbsOutputDir, resolveResult.Path.Text); ok {
 								// Prevent issues with path separators being different on Windows
 								record.Path.Text = strings.ReplaceAll(relPath, "\\", "/")
@@ -597,7 +767,7 @@ func (b *Bundle) Compile(log logging.Log, options config.Options) []OutputFile {
 	entryPointAbsPaths := make([]string, 0, len(b.entryPoints))
 	for _, entryPoint := range b.entryPoints {
 		keyPath := b.sources[entryPoint].KeyPath
-		if keyPath.IsAbsolute {
+		if keyPath.Namespace == "file" {
 			entryPointAbsPaths = append(entryPointAbsPaths, keyPath.Text)
 		}
 	}
@@ -654,7 +824,7 @@ func (b *Bundle) Compile(log logging.Log, options config.Options) []OutputFile {
 		for _, group := range resultGroups {
 			for _, sourceIndex := range group.reachableFiles {
 				keyPath := b.sources[sourceIndex].KeyPath
-				if keyPath.IsAbsolute {
+				if keyPath.Namespace == "file" {
 					lowerAbsPath := lowerCaseAbsPathForWindows(keyPath.Text)
 					sourceAbsPaths[lowerAbsPath] = sourceIndex
 				}
@@ -766,7 +936,8 @@ func (b *Bundle) generateMetadataJSON(results []OutputFile) []byte {
 			} else {
 				j.AddString(",\n    ")
 			}
-			j.AddString(fmt.Sprintf("%s: ", printer.QuoteForJSON(b.res.PrettyPath(result.AbsPath))))
+			j.AddString(fmt.Sprintf("%s: ", printer.QuoteForJSON(
+				b.res.PrettyPath(ast.Path{Text: result.AbsPath, Namespace: "file"}))))
 			j.AddBytes(result.jsonMetadataChunk)
 		}
 	}

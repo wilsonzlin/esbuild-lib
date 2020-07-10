@@ -1,6 +1,6 @@
 export type Platform = 'browser' | 'node';
 export type Format = 'iife' | 'cjs' | 'esm';
-export type Loader = 'js' | 'jsx' | 'ts' | 'tsx' | 'json' | 'text' | 'base64' | 'file' | 'dataurl' | 'binary';
+export type Loader = 'js' | 'jsx' | 'ts' | 'tsx' | 'json' | 'text' | 'base64' | 'file' | 'dataurl' | 'binary' | 'default';
 export type LogLevel = 'info' | 'warning' | 'error' | 'silent';
 export type Strict = 'nullish-coalescing' | 'class-fields';
 
@@ -42,6 +42,7 @@ export interface BuildOptions extends CommonOptions {
 
   entryPoints?: string[];
   stdin?: StdinOptions;
+  plugins: ((plugin: Plugin) => void)[];
 }
 
 export interface StdinOptions {
@@ -53,13 +54,16 @@ export interface StdinOptions {
 
 export interface Message {
   text: string;
-  location: null | {
-    file: string;
-    line: number; // 1-based
-    column: number; // 0-based, in bytes
-    length: number; // in bytes
-    lineText: string;
-  };
+  location: Location | null;
+}
+
+export interface Location {
+  file: string;
+  namespace: string;
+  line: number; // 1-based
+  column: number; // 0-based, in bytes
+  length: number; // in bytes
+  lineText: string;
 }
 
 export interface OutputFile {
@@ -91,6 +95,54 @@ export interface TransformResult {
 export interface TransformFailure extends Error {
   errors: Message[];
   warnings: Message[];
+}
+
+export interface Plugin {
+  setName(name: string): void;
+  addResolver(options: ResolverOptions, callback: (args: ResolverArgs) =>
+    (ResolverResult | null | undefined | Promise<ResolverResult | null | undefined>)): void;
+  addLoader(options: LoaderOptions, callback: (args: LoaderArgs) =>
+    (LoaderResult | null | undefined | Promise<LoaderResult | null | undefined>)): void;
+}
+
+export interface ResolverOptions {
+  filter: RegExp;
+}
+
+export interface ResolverArgs {
+  path: string;
+  importDir: string;
+}
+
+export interface ResolverResult {
+  errors?: PartialMessage[];
+  warnings?: PartialMessage[];
+
+  path?: string;
+  external?: boolean;
+  namespace?: string;
+}
+
+export interface LoaderOptions {
+  filter: RegExp;
+  namespace?: string;
+}
+
+export interface LoaderArgs {
+  path: string;
+}
+
+export interface LoaderResult {
+  errors?: PartialMessage[];
+  warnings?: PartialMessage[];
+
+  contents?: string | Uint8Array;
+  loader?: Loader;
+}
+
+export interface PartialMessage {
+  text?: string;
+  location?: Partial<Location> | null;
 }
 
 // This is the type information for the "metafile" JSON format

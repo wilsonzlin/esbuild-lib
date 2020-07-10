@@ -2,6 +2,7 @@ import * as types from "./types";
 import * as common from "./common";
 import * as child_process from "child_process";
 import * as path from "path";
+import * as fs from "fs";
 import { isatty } from "tty";
 
 // This file is used for both the "esbuild" package and the "esbuild-wasm"
@@ -72,6 +73,8 @@ let startService: typeof types.startService = options => {
     writeToStdin(bytes) {
       child.stdin.write(bytes);
     },
+    readFileSync: fs.readFileSync,
+    isSync: false,
   });
   child.stdout.on('data', readFromStdout);
   child.stdout.on('end', afterClose);
@@ -98,6 +101,7 @@ let runServiceSync = (callback: (service: common.StreamService) => void): void =
       if (stdin.length !== 0) throw new Error('Must run at most one command');
       stdin = bytes;
     },
+    isSync: true,
   });
   callback(service);
   let stdout = child_process.execFileSync(command, args.concat('--service'), {

@@ -3,8 +3,10 @@ package api
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/evanw/esbuild/internal/ast"
 	"github.com/evanw/esbuild/internal/bundler"
@@ -93,6 +95,8 @@ func validateStrict(value StrictOptions) config.StrictOptions {
 
 func validateLoader(value Loader) config.Loader {
 	switch value {
+	case LoaderNone:
+		return config.LoaderNone
 	case LoaderJS:
 		return config.LoaderJS
 	case LoaderJSX:
@@ -113,6 +117,8 @@ func validateLoader(value Loader) config.Loader {
 		return config.LoaderFile
 	case LoaderBinary:
 		return config.LoaderBinary
+	case LoaderDefault:
+		return config.LoaderDefault
 	default:
 		panic("Invalid loader")
 	}
@@ -340,20 +346,21 @@ func validatePath(log logging.Log, fs fs.FS, relPath string) string {
 	return absPath
 }
 
-func messagesOfKind(kind logging.MsgKind, msgs []logging.Msg) []Message {
+func convertMessagesToPublic(kind logging.MsgKind, msgs []logging.Msg) []Message {
 	var filtered []Message
 	for _, msg := range msgs {
 		if msg.Kind == kind {
 			var location *Location
+			loc := msg.Location
 
-			if msg.Location != nil {
-				loc := msg.Location
+			if loc != nil {
 				location = &Location{
-					File:     loc.File,
-					Line:     loc.Line,
-					Column:   loc.Column,
-					Length:   loc.Length,
-					LineText: loc.LineText,
+					File:      loc.File,
+					Namespace: loc.Namespace,
+					Line:      loc.Line,
+					Column:    loc.Column,
+					Length:    loc.Length,
+					LineText:  loc.LineText,
 				}
 			}
 
@@ -364,6 +371,35 @@ func messagesOfKind(kind logging.MsgKind, msgs []logging.Msg) []Message {
 		}
 	}
 	return filtered
+}
+
+func convertMessagesToInternal(msgs []logging.Msg, kind logging.MsgKind, messages []Message) []logging.Msg {
+	for _, message := range messages {
+		var location *logging.MsgLocation
+		loc := message.Location
+
+		if loc != nil {
+			namespace := loc.Namespace
+			if namespace == "" {
+				namespace = "file"
+			}
+			location = &logging.MsgLocation{
+				File:      loc.File,
+				Namespace: namespace,
+				Line:      loc.Line,
+				Column:    loc.Column,
+				Length:    loc.Length,
+				LineText:  loc.LineText,
+			}
+		}
+
+		msgs = append(msgs, logging.Msg{
+			Kind:     kind,
+			Text:     message.Text,
+			Location: location,
+		})
+	}
+	return msgs
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -480,6 +516,8 @@ func buildImpl(buildOpts BuildOptions) BuildResult {
 		log.AddError(nil, ast.Loc{}, "Splitting currently only works with the \"esm\" format")
 	}
 
+	loadPlugins(&options, log, buildOpts.Plugins)
+
 	var outputFiles []OutputFile
 
 	// Stop now if there were errors
@@ -509,8 +547,8 @@ func buildImpl(buildOpts BuildOptions) BuildResult {
 
 	msgs := log.Done()
 	return BuildResult{
-		Errors:      messagesOfKind(logging.Error, msgs),
-		Warnings:    messagesOfKind(logging.Warning, msgs),
+		Errors:      convertMessagesToPublic(logging.Error, msgs),
+		Warnings:    convertMessagesToPublic(logging.Warning, msgs),
 		OutputFiles: outputFiles,
 	}
 }
@@ -529,6 +567,14 @@ func transformImpl(input string, transformOpts TransformOptions) TransformResult
 			Color:         validateColor(transformOpts.Color),
 			LogLevel:      validateLogLevel(transformOpts.LogLevel),
 		})
+	}
+
+	// Apply default values
+	if transformOpts.Sourcefile == "" {
+		transformOpts.Sourcefile = "<stdin>"
+	}
+	if transformOpts.Loader == LoaderNone {
+		transformOpts.Loader = LoaderJS
 	}
 
 	// Convert and validate the transformOpts
@@ -594,9 +640,207 @@ func transformImpl(input string, transformOpts TransformOptions) TransformResult
 
 	msgs := log.Done()
 	return TransformResult{
-		Errors:      messagesOfKind(logging.Error, msgs),
-		Warnings:    messagesOfKind(logging.Warning, msgs),
+		Errors:      convertMessagesToPublic(logging.Error, msgs),
+		Warnings:    convertMessagesToPublic(logging.Warning, msgs),
 		JS:          js,
 		JSSourceMap: jsSourceMap,
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Plugin API
+
+type pluginImpl struct {
+	log       logging.Log
+	name      string
+	resolvers []config.ResolverPlugin
+	loaders   []config.LoaderPlugin
+}
+
+func (impl *pluginImpl) SetName(name string) {
+	if name == "" {
+		impl.log.AddError(nil, ast.Loc{}, "Name of plugin cannot be empty")
+		return
+	}
+
+	if impl.name != "" {
+		impl.log.AddError(nil, ast.Loc{}, "Name of plugin cannot be set multiple times")
+		return
+	}
+
+	impl.name = name
+}
+
+var filterMutex sync.Mutex
+var filterCache map[string]*regexp.Regexp
+
+func compileFilter(filter string) (result *regexp.Regexp) {
+	if filter == "" {
+		// Must provide a filter
+		return nil
+	}
+	ok := false
+
+	// Cache hit?
+	(func() {
+		filterMutex.Lock()
+		defer filterMutex.Unlock()
+		if filterCache != nil {
+			result, ok = filterCache[filter]
+		}
+	})()
+	if ok {
+		return
+	}
+
+	// Cache miss
+	result, err := regexp.Compile(filter)
+	if err != nil {
+		return nil
+	}
+
+	// Cache for next time
+	filterMutex.Lock()
+	defer filterMutex.Unlock()
+	if filterCache == nil {
+		filterCache = make(map[string]*regexp.Regexp)
+	}
+	filterCache[filter] = result
+	return
+}
+
+func (impl *pluginImpl) AddResolver(options ResolverOptions, callback func(ResolverArgs) (ResolverResult, error)) {
+	if impl.name == "" {
+		impl.log.AddError(nil, ast.Loc{}, "Set the plugin name before adding a resolver")
+		return
+	}
+
+	if options.Filter == "" {
+		impl.log.AddError(nil, ast.Loc{}, fmt.Sprintf("[%s] Resolver is missing a filter", impl.name))
+		return
+	}
+
+	filter := compileFilter(options.Filter)
+	if filter == nil {
+		impl.log.AddError(nil, ast.Loc{},
+			fmt.Sprintf("[%s] Resolver filter is not a valid regular expression: %q", impl.name, options.Filter))
+		return
+	}
+
+	impl.resolvers = append(impl.resolvers, config.ResolverPlugin{
+		Name:   impl.name,
+		Filter: filter,
+		Callback: func(args config.ResolverArgs) (result config.ResolverResult) {
+			response, err := callback(ResolverArgs{
+				Path:      args.Path,
+				ImportDir: args.ImportDir,
+			})
+
+			if err != nil {
+				result.ThrownError = err
+				return
+			}
+
+			if response.Namespace == "" {
+				response.Namespace = "file"
+			}
+			result.Path = ast.Path{Text: response.Path, Namespace: response.Namespace}
+			result.External = response.External
+
+			// Convert log messages
+			if len(response.Errors)+len(response.Warnings) > 0 {
+				msgs := make(sortableMsgs, 0, len(response.Errors)+len(response.Warnings))
+				msgs = convertMessagesToInternal(msgs, logging.Error, response.Errors)
+				msgs = convertMessagesToInternal(msgs, logging.Warning, response.Warnings)
+				sort.Sort(msgs)
+				result.Msgs = msgs
+			}
+			return
+		},
+	})
+}
+
+func (impl *pluginImpl) AddLoader(options LoaderOptions, callback func(LoaderArgs) (LoaderResult, error)) {
+	if impl.name == "" {
+		impl.log.AddError(nil, ast.Loc{}, "Set the plugin name before adding a loader")
+		return
+	}
+
+	if options.Filter == "" {
+		impl.log.AddError(nil, ast.Loc{}, fmt.Sprintf("[%s] Loader is missing a filter", impl.name))
+		return
+	}
+
+	filter := compileFilter(options.Filter)
+	if filter == nil {
+		impl.log.AddError(nil, ast.Loc{},
+			fmt.Sprintf("[%s] Loader filter is not a valid regular expression: %q", impl.name, options.Filter))
+		return
+	}
+
+	if options.Namespace == "" {
+		options.Namespace = "file"
+	}
+
+	impl.loaders = append(impl.loaders, config.LoaderPlugin{
+		Name:      impl.name,
+		Filter:    filter,
+		Namespace: options.Namespace,
+		Callback: func(args config.LoaderArgs) (result config.LoaderResult) {
+			response, err := callback(LoaderArgs{
+				Path: args.Path.Text,
+			})
+
+			if err != nil {
+				result.ThrownError = err
+				return
+			}
+
+			result.Contents = response.Contents
+			result.Loader = validateLoader(response.Loader)
+
+			// Convert log messages
+			if len(response.Errors)+len(response.Warnings) > 0 {
+				msgs := make(sortableMsgs, 0, len(response.Errors)+len(response.Warnings))
+				msgs = convertMessagesToInternal(msgs, logging.Error, response.Errors)
+				msgs = convertMessagesToInternal(msgs, logging.Warning, response.Warnings)
+				sort.Sort(msgs)
+				result.Msgs = msgs
+			}
+			return
+		},
+	})
+}
+
+// This type is just so we can use Go's native sort function
+type sortableMsgs []logging.Msg
+
+func (a sortableMsgs) Len() int          { return len(a) }
+func (a sortableMsgs) Swap(i int, j int) { a[i], a[j] = a[j], a[i] }
+
+func (a sortableMsgs) Less(i int, j int) bool {
+	ai := a[i].Location
+	aj := a[j].Location
+	if ai == nil || aj == nil {
+		return ai == nil && aj != nil
+	}
+	if ai.File != aj.File {
+		return ai.File < aj.File
+	}
+	if ai.Line != aj.Line {
+		return ai.Line < aj.Line
+	}
+	if ai.Column != aj.Column {
+		return ai.Column < aj.Column
+	}
+	return a[i].Text < a[j].Text
+}
+
+func loadPlugins(options *config.Options, log logging.Log, plugins []func(Plugin)) {
+	for _, item := range plugins {
+		impl := &pluginImpl{log: log}
+		item(impl)
+		options.ResolverPlugins = append(options.ResolverPlugins, impl.resolvers...)
+		options.LoaderPlugins = append(options.LoaderPlugins, impl.loaders...)
 	}
 }

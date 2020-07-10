@@ -30,6 +30,7 @@ type FS interface {
 	// This is part of the interface because the mock interface used for tests
 	// should not depend on file system behavior (i.e. different slashes for
 	// Windows) while the real interface should.
+	IsAbs(path string) bool
 	Abs(path string) (string, bool)
 	Dir(path string) string
 	Base(path string) string
@@ -84,6 +85,10 @@ func (fs *mockFS) ReadDirectory(path string) map[string]Entry {
 func (fs *mockFS) ReadFile(path string) (string, bool) {
 	contents, ok := fs.files[path]
 	return contents, ok
+}
+
+func (*mockFS) IsAbs(p string) bool {
+	return path.IsAbs(p)
 }
 
 func (*mockFS) Abs(p string) (string, bool) {
@@ -272,6 +277,10 @@ func (fs *realFS) ReadDirectory(dir string) map[string]Entry {
 func (fs *realFS) ReadFile(path string) (string, bool) {
 	buffer, err := ioutil.ReadFile(path)
 	return string(buffer), err == nil
+}
+
+func (*realFS) IsAbs(p string) bool {
+	return filepath.IsAbs(p)
 }
 
 func (*realFS) Abs(p string) (string, bool) {

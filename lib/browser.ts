@@ -59,6 +59,7 @@ let startService: typeof types.startService = options => {
       writeToStdin(bytes) {
         worker.postMessage(bytes)
       },
+      isSync: false,
     })
 
     return {

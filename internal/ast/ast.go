@@ -248,23 +248,17 @@ type LocRef struct {
 	Ref Ref
 }
 
-// This is used to represent both file system paths (IsAbsolute == true) and
-// abstract module paths (IsAbsolute == false). Abstract module paths represent
+// This is used to represent both file system paths (Namespace == "file") and
+// abstract module paths (Namespace != "file"). Abstract module paths represent
 // "virtual modules" when used for an input file and "package paths" when used
 // to represent an external module.
 type Path struct {
-	Text       string
-	IsAbsolute bool
+	Text      string
+	Namespace string
 }
 
 func (a Path) ComesBeforeInSortedOrder(b Path) bool {
-	if !a.IsAbsolute && b.IsAbsolute {
-		return false
-	}
-	if a.IsAbsolute && !b.IsAbsolute {
-		return true
-	}
-	return a.Text < b.Text
+	return a.Namespace > b.Namespace || (a.Namespace == b.Namespace && a.Text < b.Text)
 }
 
 type PropertyKind int

@@ -13,6 +13,8 @@ import (
 	"github.com/evanw/esbuild/internal/parser"
 )
 
+const BrowserFalseNamespace = "empty"
+
 type ResolveResult struct {
 	Path       ast.Path
 	IsExternal bool
@@ -31,9 +33,8 @@ type ResolveResult struct {
 
 type Resolver interface {
 	Resolve(sourceDir string, importPath string) *ResolveResult
-	ResolveAbs(absPath string) *ResolveResult
 	Read(path string) (string, bool)
-	PrettyPath(path string) string
+	PrettyPath(path ast.Path) string
 }
 
 type resolver struct {
@@ -71,24 +72,22 @@ func NewResolver(fs fs.FS, log logging.Log, options config.Options) Resolver {
 }
 
 func (r *resolver) Resolve(sourceDir string, importPath string) *ResolveResult {
-	path, isExternal := r.resolveWithoutSymlinks(sourceDir, importPath)
-	if path == nil {
+	result := r.resolveWithoutSymlinks(sourceDir, importPath)
+	if result == nil {
 		return nil
 	}
 
 	// If successful, resolve symlinks using the directory info cache
-	return r.finalizeResolve(*path, isExternal)
+	return r.finalizeResolve(*result)
 }
 
 func (r *resolver) ResolveAbs(absPath string) *ResolveResult {
 	// Just decorate the absolute path with information from parent directories
-	return r.finalizeResolve(ast.Path{Text: absPath, IsAbsolute: true}, false)
+	return r.finalizeResolve(ResolveResult{Path: ast.Path{Text: absPath, Namespace: "file"}})
 }
 
-func (r *resolver) finalizeResolve(path ast.Path, isExternal bool) *ResolveResult {
-	result := ResolveResult{Path: path, IsExternal: isExternal}
-
-	if result.Path.IsAbsolute {
+func (r *resolver) finalizeResolve(result ResolveResult) *ResolveResult {
+	if result.Path.Namespace == "file" {
 		if dirInfo := r.dirInfoCached(r.fs.Dir(result.Path.Text)); dirInfo != nil {
 			base := r.fs.Base(result.Path.Text)
 
@@ -126,35 +125,36 @@ func (r *resolver) finalizeResolve(path ast.Path, isExternal bool) *ResolveResul
 	return &result
 }
 
-func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (path *ast.Path, isExternal bool) {
+func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) *ResolveResult {
 	// This implements the module resolution algorithm from node.js, which is
 	// described here: https://nodejs.org/api/modules.html#modules_all_together
 	result := ""
 
-	if !IsPackagePath(importPath) {
-		pathText := importPath
-		isAbsolute := false
-
-		// Join relative paths with the directory containing the source file. These
-		// paths are then considered absolute paths, which will cause the output
-		// file to contain a relative path to this external file.
-		//
-		// Paths starting with a slash are treated as opaque strings instead of
-		// absolute paths. They are probably URLs and should be left alone.
-		if !strings.HasPrefix(importPath, "/") {
-			pathText = r.fs.Join(sourceDir, importPath)
-			isAbsolute = true
+	// Return early if this is already an absolute path
+	if r.fs.IsAbs(importPath) {
+		if r.options.ExternalModules.AbsPaths != nil && r.options.ExternalModules.AbsPaths[importPath] {
+			// If the string literal in the source text is an absolute path and has
+			// been marked as an external module, mark it as *not* an absolute path.
+			// That way we preserve the literal text in the output and don't generate
+			// a relative path from the output directory to that path.
+			return &ResolveResult{Path: ast.Path{Text: importPath}, IsExternal: true}
 		}
+
+		return &ResolveResult{Path: ast.Path{Text: importPath, Namespace: "file"}}
+	}
+
+	if !IsPackagePath(importPath) {
+		absPath := r.fs.Join(sourceDir, importPath)
 
 		// Check for external packages first
-		if r.options.ExternalModules.AbsPaths != nil && r.options.ExternalModules.AbsPaths[pathText] {
-			return &ast.Path{Text: pathText, IsAbsolute: isAbsolute}, true
+		if r.options.ExternalModules.AbsPaths != nil && r.options.ExternalModules.AbsPaths[absPath] {
+			return &ResolveResult{Path: ast.Path{Text: absPath, Namespace: "file"}, IsExternal: true}
 		}
 
-		if absolute, ok := r.loadAsFileOrDirectory(pathText); ok {
+		if absolute, ok := r.loadAsFileOrDirectory(absPath); ok {
 			result = absolute
 		} else {
-			return nil, false
+			return nil
 		}
 	} else {
 		// Check for external packages first
@@ -162,7 +162,7 @@ func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (
 			query := importPath
 			for {
 				if r.options.ExternalModules.NodeModules[query] {
-					return &ast.Path{Text: importPath}, true
+					return &ResolveResult{Path: ast.Path{Text: importPath}, IsExternal: true}
 				}
 
 				// If the module "foo" has been marked as external, we also want to treat
@@ -178,7 +178,7 @@ func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (
 		sourceDirInfo := r.dirInfoCached(sourceDir)
 		if sourceDirInfo == nil {
 			// Bail if the directory is missing for some reason
-			return nil, false
+			return nil
 		}
 
 		// Support remapping one package path to another via the "browser" field
@@ -189,9 +189,9 @@ func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (
 					if remapped == nil {
 						// "browser": {"module": false}
 						if absolute, ok := r.loadNodeModules(importPath, sourceDirInfo); ok {
-							return &ast.Path{Text: "disabled:" + absolute}, false
+							return &ResolveResult{Path: ast.Path{Text: absolute, Namespace: BrowserFalseNamespace}}
 						} else {
-							return &ast.Path{Text: "disabled:" + importPath}, false
+							return &ResolveResult{Path: ast.Path{Text: importPath, Namespace: BrowserFalseNamespace}}
 						}
 					} else {
 						// "browser": {"module": "./some-file"}
@@ -207,7 +207,7 @@ func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (
 			result = absolute
 		} else {
 			// Note: node's "self references" are not currently supported
-			return nil, false
+			return nil
 		}
 	}
 
@@ -221,17 +221,17 @@ func (r *resolver) resolveWithoutSymlinks(sourceDir string, importPath string) (
 		if packageJson.browserNonPackageMap != nil {
 			if remapped, ok := packageJson.browserNonPackageMap[result]; ok {
 				if remapped == nil {
-					return &ast.Path{Text: "disabled:" + result}, false
+					return &ResolveResult{Path: ast.Path{Text: result, Namespace: BrowserFalseNamespace}}
 				}
 				result, ok = r.resolveWithoutRemapping(resultDirInfo.enclosingBrowserScope, *remapped)
 				if !ok {
-					return nil, false
+					return nil
 				}
 			}
 		}
 	}
 
-	return &ast.Path{Text: result, IsAbsolute: true}, false
+	return &ResolveResult{Path: ast.Path{Text: result, Namespace: "file"}}
 }
 
 func (r *resolver) resolveWithoutRemapping(sourceDirInfo *dirInfo, importPath string) (string, bool) {
@@ -247,19 +247,25 @@ func (r *resolver) Read(path string) (string, bool) {
 	return contents, ok
 }
 
-func (r *resolver) PrettyPath(path string) string {
-	if rel, ok := r.fs.Rel(r.fs.Cwd(), path); ok {
-		path = rel
+func (r *resolver) PrettyPath(path ast.Path) string {
+	if path.Namespace == "file" {
+		if rel, ok := r.fs.Rel(r.fs.Cwd(), path.Text); ok {
+			path.Text = rel
+		}
+
+		// These human-readable paths are used in error messages, comments in output
+		// files, source names in source maps, and paths in the metadata JSON file.
+		// These should be platform-independent so our output doesn't depend on which
+		// operating system it was run. Replace Windows backward slashes with standard
+		// forward slashes.
+		return strings.ReplaceAll(path.Text, "\\", "/")
 	}
 
-	// These human-readable paths are used in error messages, comments in output
-	// files, source names in source maps, and paths in the metadata JSON file.
-	// These should be platform-independent so our output doesn't depend on which
-	// operating system it was run. Replace Windows backward slashes with standard
-	// forward slashes.
-	path = strings.ReplaceAll(path, "\\", "/")
+	if path.Namespace != "" {
+		return fmt.Sprintf("%s:%s", path.Namespace, path.Text)
+	}
 
-	return path
+	return path.Text
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -798,9 +804,10 @@ const (
 
 func (r *resolver) parseJSON(path string, options parser.ParseJSONOptions) (ast.Expr, logging.Source, parseStatus) {
 	if contents, ok := r.fs.ReadFile(path); ok {
+		keyPath := ast.Path{Text: path, Namespace: "file"}
 		source := logging.Source{
-			KeyPath:    ast.Path{Text: path},
-			PrettyPath: r.PrettyPath(path),
+			KeyPath:    keyPath,
+			PrettyPath: r.PrettyPath(keyPath),
 			Contents:   contents,
 		}
 		if result, ok := parser.ParseJSON(r.log, source, options); ok {

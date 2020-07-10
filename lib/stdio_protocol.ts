@@ -7,10 +7,19 @@
 import * as types from "./types";
 
 export interface BuildRequest {
+  command: 'build';
+  key: number;
   flags: string[];
   write: boolean;
   stdin: string | null;
   resolveDir: string | null;
+  plugins?: BuildPlugin[];
+}
+
+export interface BuildPlugin {
+  name: string;
+  resolvers: { id: number, filter: string }[];
+  loaders: { id: number, filter: string, namespace: string }[];
 }
 
 export interface BuildResponse {
@@ -20,6 +29,7 @@ export interface BuildResponse {
 }
 
 export interface TransformRequest {
+  command: 'transform';
   flags: string[];
   input: string;
 }
@@ -29,6 +39,38 @@ export interface TransformResponse {
   warnings: types.Message[];
   js: string;
   jsSourceMap: string;
+}
+
+export interface ResolverRequest {
+  command: 'resolver';
+  key: number;
+  id: number;
+  path: string;
+  importDir: string;
+}
+
+export interface ResolverResponse {
+  errors?: types.PartialMessage[];
+  warnings?: types.PartialMessage[];
+
+  path?: string;
+  external?: boolean;
+  namespace?: string;
+}
+
+export interface LoaderRequest {
+  command: 'loader';
+  key: number;
+  id: number;
+  path: string;
+}
+
+export interface LoaderResponse {
+  errors?: types.PartialMessage[];
+  warnings?: types.PartialMessage[];
+
+  contents?: Uint8Array;
+  loader?: string;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -57,7 +99,7 @@ export function encodePacket(packet: Packet): Uint8Array {
       bb.write8(+value);
     } else if (typeof value === 'number') {
       bb.write8(2);
-      bb.write32(value);
+      bb.write32(value | 0);
     } else if (typeof value === 'string') {
       bb.write8(3);
       bb.write(encodeUTF8(value));

@@ -53,6 +53,7 @@ function flagsForBuildOptions(options: types.BuildOptions, isTTY: boolean): [str
 
   if (options.entryPoints) {
     for (let entryPoint of options.entryPoints) {
+      entryPoint += '';
       if (entryPoint.startsWith('-')) throw new Error(`Invalid entry point: ${entryPoint}`);
       flags.push(entryPoint);
     }
@@ -81,7 +82,9 @@ function flagsForTransformOptions(options: types.TransformOptions, isTTY: boolea
 }
 
 export interface StreamIn {
-  writeToStdin: (data: Uint8Array) => void,
+  writeToStdin: (data: Uint8Array) => void;
+  readFileSync?: (path: string, encoding: string) => string;
+  isSync: boolean;
 }
 
 export interface StreamOut {
@@ -95,11 +98,17 @@ export interface StreamService {
   transform(input: string, options: types.TransformOptions, isTTY: boolean, callback: (err: Error | null, res: types.TransformResult | null) => void): void;
 }
 
-// This can't use any promises because it must work for both sync and async code
-export function createChannel(options: StreamIn): StreamOut {
-  let callbacks = new Map<number, (error: string | null, response: protocol.Value) => void>();
+// This can't use any promises in the main execution flow because it must work
+// for both sync and async code. There is an exception for plugin code because
+// that can't work in sync code anyway.
+export function createChannel(streamIn: StreamIn): StreamOut {
+  type PluginCallback = (request: protocol.ResolverRequest | protocol.LoaderRequest) => Promise<protocol.ResolverResponse | protocol.LoaderResponse>
+
+  let responseCallbacks = new Map<number, (error: string | null, response: protocol.Value) => void>();
+  let pluginCallbacks = new Map<number, PluginCallback>();
   let isClosed = false;
-  let nextID = 0;
+  let nextRequestID = 0;
+  let nextBuildKey = 0;
 
   // Use a long-lived buffer to store stdout data
   let stdout = new Uint8Array(4096);
@@ -135,38 +144,48 @@ export function createChannel(options: StreamIn): StreamOut {
   let afterClose = () => {
     // When the process is closed, fail all pending requests
     isClosed = true;
-    for (let callback of callbacks.values()) {
+    for (let callback of responseCallbacks.values()) {
       callback('The service was stopped', null);
     }
-    callbacks.clear();
+    responseCallbacks.clear();
   };
 
-  let sendRequest = <Req, Res>(value: [string, Req], callback: (error: string | null, response: Res | null) => void): void => {
+  let sendRequest = <Req, Res>(value: Req, callback: (error: string | null, response: Res | null) => void): void => {
     if (isClosed) return callback('The service is no longer running', null);
-    let id = nextID++;
-    callbacks.set(id, callback as any);
-    options.writeToStdin(protocol.encodePacket({ id, isRequest: true, value: value as any }));
+    let id = nextRequestID++;
+    responseCallbacks.set(id, callback as any);
+    streamIn.writeToStdin(protocol.encodePacket({ id, isRequest: true, value: value as any }));
   };
 
   let sendResponse = (id: number, value: protocol.Value): void => {
     if (isClosed) throw new Error('The service is no longer running');
-    options.writeToStdin(protocol.encodePacket({ id, isRequest: false, value }));
+    streamIn.writeToStdin(protocol.encodePacket({ id, isRequest: false, value }));
   };
 
-  let handleRequest = (id: number, command: string, request: protocol.Value) => {
+  let handleRequest = async (id: number, request: any) => {
     // Catch exceptions in the code below so they get passed to the caller
     try {
+      let command = request.command;
       switch (command) {
+        case 'resolver': {
+          let resolverRequest: protocol.ResolverRequest = request;
+          let callback = pluginCallbacks.get(resolverRequest.key);
+          sendResponse(id, await callback!(resolverRequest) as any);
+          break;
+        }
+
+        case 'loader': {
+          let loaderRequest: protocol.LoaderRequest = request;
+          let callback = pluginCallbacks.get(loaderRequest.key);
+          sendResponse(id, await callback!(loaderRequest) as any);
+          break;
+        }
+
         default:
           throw new Error(`Invalid command: ` + command);
       }
     } catch (e) {
-      let error = 'Internal error'
-      try {
-        error = e + '';
-      } catch {
-      }
-      sendResponse(id, { error });
+      sendResponse(id, { errors: [await extractErrorMessageV8(e, streamIn)] } as any);
     }
   };
 
@@ -174,15 +193,118 @@ export function createChannel(options: StreamIn): StreamOut {
     let packet = protocol.decodePacket(bytes) as any;
 
     if (packet.isRequest) {
-      handleRequest(packet.id, packet.value[0], packet.value[1]);
+      handleRequest(packet.id, packet.value);
     }
 
     else {
-      let callback = callbacks.get(packet.id)!;
-      callbacks.delete(packet.id);
+      let callback = responseCallbacks.get(packet.id)!;
+      responseCallbacks.delete(packet.id);
       if (packet.value.error) callback(packet.value.error, {});
       else callback(null, packet.value);
     }
+  };
+
+  let handlePlugins = (plugins: ((plugin: types.Plugin) => void)[], request: protocol.BuildRequest, buildKey: number) => {
+    if (streamIn.isSync) throw new Error('Cannot use plugins in synchronous API calls');
+
+    let resolverCallbacks: {
+      [id: number]: (args: types.ResolverArgs) =>
+        (types.ResolverResult | null | undefined | Promise<types.ResolverResult | null | undefined>)
+    } = {};
+    let loaderCallbacks: {
+      [id: number]: (args: types.LoaderArgs) =>
+        (types.LoaderResult | null | undefined | Promise<types.LoaderResult | null | undefined>)
+    } = {};
+    let nextCallbackID = 0;
+
+    request.plugins = [];
+
+    for (let callback of plugins) {
+      let plugin: protocol.BuildPlugin = {
+        name: '',
+        loaders: [],
+        resolvers: [],
+      };
+
+      callback({
+        setName(value) {
+          value += '';
+          if (value === '') throw new Error('Name of plugin cannot be empty');
+          if (plugin.name !== '') throw new Error('Name of plugin cannot be set multiple times');
+          plugin.name = value;
+        },
+
+        addResolver(options, callback) {
+          if (plugin.name === '') throw new Error('Set the plugin name before adding a resolver')
+          let filter = options.filter;
+          if (filter == null) throw new Error(`[${plugin.name}] Resolver is missing a filter`);
+          if (!(filter instanceof RegExp)) throw new Error(`[${plugin.name}] Resolver filter must be a RegExp object`);
+          let id = nextCallbackID++;
+          resolverCallbacks[id] = callback;
+          plugin.resolvers.push({ id, filter: filter.source });
+        },
+
+        addLoader(options, callback) {
+          if (plugin.name === '') throw new Error('Set the plugin name before adding a loader')
+          let filter = options.filter;
+          if (filter == null) throw new Error(`[${plugin.name}] Loader is missing a filter`);
+          if (!(filter instanceof RegExp)) throw new Error(`[${plugin.name}] Loader filter must be a RegExp object`);
+          let id = nextCallbackID++;
+          loaderCallbacks[id] = callback;
+          plugin.loaders.push({ id, filter: filter.source, namespace: (options.namespace ?? '') + '' });
+        },
+      });
+
+      if (plugin.name !== '') {
+        request.plugins.push(plugin);
+      }
+    }
+
+    pluginCallbacks.set(buildKey, async (request) => {
+      switch (request.command) {
+        case 'resolver': {
+          let callback = resolverCallbacks[request.id];
+          let result = await callback({
+            path: request.path,
+            importDir: request.importDir,
+          });
+
+          let response: protocol.ResolverResponse = {};
+
+          if (result != null) {
+            let { path, namespace, external, errors, warnings } = result;
+            if (path != null) response.path = path + '';
+            if (namespace != null) response.namespace = namespace + '';
+            if (external != null) response.external = !!external;
+            if (errors != null) response.errors = sanitizeMessages(errors);
+            if (warnings != null) response.warnings = sanitizeMessages(warnings);
+          }
+
+          return response;
+        }
+
+        case 'loader': {
+          let callback = loaderCallbacks[request.id];
+          let result = await callback({
+            path: request.path,
+          });
+          let response: protocol.LoaderResponse = {};
+
+          if (result != null) {
+            let { contents, loader, errors, warnings } = result;
+            if (contents instanceof Uint8Array) response.contents = contents;
+            else if (contents != null) response.contents = protocol.encodeUTF8(contents + '');
+            if (loader != null) response.loader = loader + '';
+            if (errors != null) response.errors = sanitizeMessages(errors);
+            if (warnings != null) response.warnings = sanitizeMessages(warnings);
+          }
+
+          return response;
+        }
+      }
+    });
+
+    return () => pluginCallbacks.delete(buildKey);
   };
 
   return {
@@ -192,10 +314,13 @@ export function createChannel(options: StreamIn): StreamOut {
     service: {
       build(options, isTTY, callback) {
         let [flags, stdin, resolveDir] = flagsForBuildOptions(options, isTTY);
-        let write = options.write !== false;
-        sendRequest<protocol.BuildRequest, protocol.BuildResponse>(
-          ['build', { flags, write, stdin, resolveDir }],
-          (error, response) => {
+        try {
+          let key = nextBuildKey++;
+          let write = options.write !== false;
+          let request: protocol.BuildRequest = { command: 'build', key, flags, write, stdin, resolveDir };
+          let cleanup = 'plugins' in options && handlePlugins(options.plugins, request, key);
+          sendRequest<protocol.BuildRequest, protocol.BuildResponse>(request, (error, response) => {
+            if (cleanup) cleanup();
             if (error) return callback(new Error(error), null);
             let errors = response!.errors;
             let warnings = response!.warnings;
@@ -203,25 +328,89 @@ export function createChannel(options: StreamIn): StreamOut {
             let result: types.BuildResult = { warnings };
             if (!write) result.outputFiles = response!.outputFiles;
             callback(null, result);
-          },
-        );
+          });
+        } catch (e) {
+          sendRequest({ command: 'error', flags, error: extractErrorMessageV8(e, streamIn) }, () => {
+            callback(e, null);
+          });
+        }
       },
 
       transform(input, options, isTTY, callback) {
         let flags = flagsForTransformOptions(options, isTTY);
-        sendRequest<protocol.TransformRequest, protocol.TransformResponse>(
-          ['transform', { flags, input }],
-          (error, response) => {
+        try {
+          let request: protocol.TransformRequest = { command: 'transform', flags, input };
+          sendRequest<protocol.TransformRequest, protocol.TransformResponse>(request, (error, response) => {
             if (error) return callback(new Error(error), null);
             let errors = response!.errors;
             let warnings = response!.warnings;
             if (errors.length > 0) return callback(failureErrorWithLog('Transform failed', errors, warnings), null);
             callback(null, { warnings, js: response!.js, jsSourceMap: response!.jsSourceMap });
-          },
-        );
+          });
+        } catch (e) {
+          sendRequest({ command: 'error', flags, error: extractErrorMessageV8(e, streamIn) }, () => {
+            callback(e, null);
+          });
+        }
       },
     },
   };
+}
+
+function extractErrorMessageV8(e: any, streamIn: StreamIn): types.PartialMessage {
+  let text = 'Internal error'
+  let location: Partial<types.Location> | null = null
+
+  try {
+    text = ((e && e.message) || e) + '';
+  } catch {
+  }
+
+  // Optionally attempt to extract the file from the stack trace, works in V8/node
+  try {
+    let stack = e.stack + ''
+    let lines = stack.split('\n', 3)
+    let at = '    at '
+
+    // Check to see if this looks like a V8 stack trace
+    if (streamIn.readFileSync && !lines[0].startsWith(at) && lines[1].startsWith(at)) {
+      let line = lines[1].slice(at.length)
+      while (true) {
+        // Unwrap a function name
+        let match = /^\S+ \((.*)\)$/.exec(line)
+        if (match) {
+          line = match[1]
+          continue
+        }
+
+        // Unwrap an eval wrapper
+        match = /^eval at \S+ \((.*)\)(?:, \S+:\d+:\d+)?$/.exec(line)
+        if (match) {
+          line = match[1]
+          continue
+        }
+
+        // Match on the file location
+        match = /^(\S+):(\d+):(\d+)$/.exec(line)
+        if (match) {
+          let contents = streamIn.readFileSync(match[1], 'utf8')
+          let lineText = contents.split('\n')[+match[2] - 1] || ''
+          location = {
+            file: match[1],
+            namespace: 'file',
+            line: +match[2],
+            column: +match[3] - 1,
+            length: 0,
+            lineText: lineText + '\n' + lines.slice(1).join('\n'),
+          }
+        }
+        break
+      }
+    }
+  } catch {
+  }
+
+  return { text, location }
 }
 
 function failureErrorWithLog(text: string, errors: types.Message[], warnings: types.Message[]): Error {
@@ -237,4 +426,30 @@ function failureErrorWithLog(text: string, errors: types.Message[], warnings: ty
   error.errors = errors;
   error.warnings = warnings;
   return error;
+}
+
+function sanitizeMessages(messages: types.PartialMessage[]): types.Message[] {
+  let messagesClone: types.Message[] = [];
+  for (const message of messages) {
+    let location = message.location;
+    let locationClone: types.Message['location'] = null;
+
+    if (location != null) {
+      let { file, namespace, line, column, length, lineText } = location;
+      locationClone = {
+        file: (file ?? '') + '',
+        namespace: (namespace ?? '') + '',
+        line: (line as any) | 0,
+        column: (column as any) | 0,
+        length: (length as any) | 0,
+        lineText: (lineText ?? '') + '',
+      };
+    }
+
+    messagesClone.push({
+      text: message.text + '',
+      location: locationClone,
+    });
+  }
+  return messagesClone;
 }

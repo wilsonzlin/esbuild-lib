@@ -15,6 +15,8 @@ import (
 	"runtime/debug"
 	"sync"
 
+	"github.com/evanw/esbuild/internal/helpers"
+	"github.com/evanw/esbuild/internal/logging"
 	"github.com/evanw/esbuild/pkg/api"
 	"github.com/evanw/esbuild/pkg/cli"
 )
@@ -143,19 +145,32 @@ func (service *serviceType) handleIncomingMessage(bytes []byte) (result []byte) 
 		}()
 
 		// Handle the request
-		data := p.value.([]interface{})
-		switch data[0] {
+		request := p.value.(map[string]interface{})
+		command := request["command"].(string)
+		switch command {
 		case "build":
-			return service.handleBuildRequest(p.id, data[1].(map[string]interface{}))
+			return service.handleBuildRequest(p.id, request)
 
 		case "transform":
-			return service.handleTransformRequest(p.id, data[1].(map[string]interface{}))
+			return service.handleTransformRequest(p.id, request)
+
+		case "error":
+			// This just exists so that errors during JavaScript API setup get printed
+			// nicely to the console. This matters if the JavaScript API setup code
+			// swallows thrown errors. We still want to be able to see the error.
+			flags := decodeStringArray(request["flags"].([]interface{}))
+			msg := decodeMessageToPrivate(request["error"].(map[string]interface{}))
+			logging.PrintMessageToStderr(flags, msg)
+			return encodePacket(packet{
+				id:    p.id,
+				value: make(map[string]interface{}),
+			})
 
 		default:
 			return encodePacket(packet{
 				id: p.id,
 				value: map[string]interface{}{
-					"error": fmt.Sprintf("Invalid command: %s", p.value),
+					"error": fmt.Sprintf("Invalid command: %s", command),
 				},
 			})
 		}
@@ -174,10 +189,9 @@ func (service *serviceType) handleIncomingMessage(bytes []byte) (result []byte) 
 }
 
 func (service *serviceType) handleBuildRequest(id uint32, request map[string]interface{}) []byte {
+	key := request["key"].(int)
 	write := request["write"].(bool)
 	flags := decodeStringArray(request["flags"].([]interface{}))
-	stdin, hasStdin := request["stdin"].(string)
-	resolveDir, hasResolveDir := request["resolveDir"].(string)
 
 	options, err := cli.ParseBuildOptions(flags)
 	if err == nil && write && options.Outfile == "" && options.Outdir == "" {
@@ -193,13 +207,95 @@ func (service *serviceType) handleBuildRequest(id uint32, request map[string]int
 	}
 
 	// Optionally allow input from the stdin channel
-	if hasStdin {
+	if stdin, ok := request["stdin"].(string); ok {
 		if options.Stdin == nil {
 			options.Stdin = &api.StdinOptions{}
 		}
 		options.Stdin.Contents = stdin
-		if hasResolveDir {
+		if resolveDir, ok := request["resolveDir"].(string); ok {
 			options.Stdin.ResolveDir = resolveDir
+		}
+	}
+
+	if plugins, ok := request["plugins"]; ok {
+		for _, p := range plugins.([]interface{}) {
+			func(p map[string]interface{}) {
+				options.Plugins = append(options.Plugins, func(plugin api.Plugin) {
+					plugin.SetName(p["name"].(string))
+
+					for _, resolver := range p["resolvers"].([]interface{}) {
+						resolver := resolver.(map[string]interface{})
+						plugin.AddResolver(api.ResolverOptions{
+							Filter: resolver["filter"].(string),
+						}, func(args api.ResolverArgs) (api.ResolverResult, error) {
+							result := api.ResolverResult{}
+							response := service.sendRequest(map[string]interface{}{
+								"command":   "resolver",
+								"key":       key,
+								"id":        resolver["id"].(int),
+								"path":      args.Path,
+								"importDir": args.ImportDir,
+							}).(map[string]interface{})
+							if value, ok := response["error"]; ok {
+								return api.ResolverResult{}, errors.New(value.(string))
+							}
+							if value, ok := response["path"]; ok {
+								result.Path = value.(string)
+							}
+							if value, ok := response["namespace"]; ok {
+								result.Namespace = value.(string)
+							}
+							if value, ok := response["external"]; ok {
+								result.External = value.(bool)
+							}
+							if value, ok := response["errors"]; ok {
+								result.Errors = decodeMessages(value.([]interface{}))
+							}
+							if value, ok := response["warnings"]; ok {
+								result.Warnings = decodeMessages(value.([]interface{}))
+							}
+							return result, nil
+						})
+					}
+
+					for _, loader := range p["loaders"].([]interface{}) {
+						loader := loader.(map[string]interface{})
+						plugin.AddLoader(api.LoaderOptions{
+							Filter:    loader["filter"].(string),
+							Namespace: loader["namespace"].(string),
+						}, func(args api.LoaderArgs) (api.LoaderResult, error) {
+							result := api.LoaderResult{}
+							response := service.sendRequest(map[string]interface{}{
+								"command": "loader",
+								"key":     key,
+								"id":      loader["id"].(int),
+								"path":    args.Path,
+							}).(map[string]interface{})
+							if value, ok := response["error"]; ok {
+								return api.LoaderResult{}, errors.New(value.(string))
+							}
+							if value, ok := response["contents"]; ok {
+								contents := string(value.([]byte))
+								result.Contents = &contents
+							}
+							if value, ok := response["errors"]; ok {
+								result.Errors = decodeMessages(value.([]interface{}))
+							}
+							if value, ok := response["warnings"]; ok {
+								result.Warnings = decodeMessages(value.([]interface{}))
+							}
+							if value, ok := response["loader"]; ok {
+								loader, err := helpers.ParseLoader(value.(string))
+								if err != nil {
+									return api.LoaderResult{}, err
+								}
+								result.Loader = loader
+							}
+							return result, nil
+						})
+					}
+				})
+			}(p.(map[string]interface{}))
 		}
 	}
 
@@ -298,4 +394,57 @@ func encodeMessages(msgs []api.Message) []interface{} {
 		}
 	}
 	return values
+}
+
+func decodeMessages(values []interface{}) []api.Message {
+	msgs := make([]api.Message, len(values))
+	for i, value := range values {
+		obj := value.(map[string]interface{})
+		msg := api.Message{Text: obj["text"].(string)}
+
+		// Some messages won't have a location
+		loc := obj["location"]
+		if loc != nil {
+			loc := loc.(map[string]interface{})
+			namespace := loc["namespace"].(string)
+			if namespace == "" {
+				namespace = "file"
+			}
+			msg.Location = &api.Location{
+				File:      loc["file"].(string),
+				Namespace: namespace,
+				Line:      loc["line"].(int),
+				Column:    loc["column"].(int),
+				Length:    loc["length"].(int),
+				LineText:  loc["lineText"].(string),
+			}
+		}
+
+		msgs[i] = msg
+	}
+	return msgs
+}
+
+func decodeMessageToPrivate(obj map[string]interface{}) logging.Msg {
+	msg := logging.Msg{Text: obj["text"].(string)}
+
+	// Some messages won't have a location
+	loc := obj["location"]
+	if loc != nil {
+		loc := loc.(map[string]interface{})
+		namespace := loc["namespace"].(string)
+		if namespace == "" {
+			namespace = "file"
+		}
+		msg.Location = &logging.MsgLocation{
+			File:      loc["file"].(string),
+			Namespace: namespace,
+			Line:      loc["line"].(int),
+			Column:    loc["column"].(int),
+			Length:    loc["length"].(int),
+			LineText:  loc["lineText"].(string),
+		}
+	}
+
+	return msg
 }
