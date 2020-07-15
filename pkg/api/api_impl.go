@@ -370,17 +370,7 @@ func messagesOfKind(kind logging.MsgKind, msgs []logging.Msg) []Message {
 // Build API
 
 func buildImpl(buildOpts BuildOptions) BuildResult {
-	var log logging.Log
-	if buildOpts.LogLevel == LogLevelSilent {
-		log = logging.NewDeferLog()
-	} else {
-		log = logging.NewStderrLog(logging.StderrOptions{
-			IncludeSource: true,
-			ErrorLimit:    buildOpts.ErrorLimit,
-			Color:         validateColor(buildOpts.Color),
-			LogLevel:      validateLogLevel(buildOpts.LogLevel),
-		})
-	}
+	var log = logging.NewDeferLog()
 
 	// Convert and validate the buildOpts
 	realFS := fs.RealFS()
@@ -519,17 +509,7 @@ func buildImpl(buildOpts BuildOptions) BuildResult {
 // Transform API
 
 func transformImpl(input string, transformOpts TransformOptions) TransformResult {
-	var log logging.Log
-	if transformOpts.LogLevel == LogLevelSilent {
-		log = logging.NewDeferLog()
-	} else {
-		log = logging.NewStderrLog(logging.StderrOptions{
-			IncludeSource: true,
-			ErrorLimit:    transformOpts.ErrorLimit,
-			Color:         validateColor(transformOpts.Color),
-			LogLevel:      validateLogLevel(transformOpts.LogLevel),
-		})
-	}
+	var log = logging.NewDeferLog()
 
 	// Convert and validate the transformOpts
 	options := config.Options{
