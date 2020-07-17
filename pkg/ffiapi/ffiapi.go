@@ -139,7 +139,7 @@ func callTransformApi(
 
 	// TODO Could output be larger than input?
 	coutLen := C.size_t(len(goresult.JS))
-	C.memcpy(out,unsafe.Pointer(&goresult.JS[0]), coutLen)
+	C.memcpy(out, unsafe.Pointer(&goresult.JS[0]), coutLen)
 
 	cerrors, cerrorsLen := copyToCMessageArray(alloc, goresult.Errors)
 	cwarnings, cwarningsLen := copyToCMessageArray(alloc, goresult.Warnings)
@@ -181,7 +181,7 @@ func GoTransform(
 	for i := uint64(0); i < goenginesLen; i++ {
 		engine := C.get_ffiapi_engine_array_element(engines, C.size_t(i))
 		goengines[i] = api.Engine{
-			Name: api.EngineName(engine.name),
+			Name:    api.EngineName(engine.name),
 			Version: engine.version,
 		}
 	}
@@ -193,25 +193,25 @@ func GoTransform(
 	}
 	go callTransformApi(alloc, cb, cbData, out, code, api.TransformOptions{
 		Sourcemap: api.SourceMap(sourceMap),
-		Target: api.Target(target),
-		Engines: goengines,
+		Target:    api.Target(target),
+		Engines:   goengines,
 		Strict: api.StrictOptions{
 			NullishCoalescing: bool(strictNullishCoalescing),
-			ClassFields: bool(strictClassFields),
+			ClassFields:       bool(strictClassFields),
 		},
 
-		MinifyWhitespace: bool(minifyWhitespace),
+		MinifyWhitespace:  bool(minifyWhitespace),
 		MinifyIdentifiers: bool(minifyIdentifiers),
-		MinifySyntax: bool(minifySyntax),
+		MinifySyntax:      bool(minifySyntax),
 
-		JSXFactory: jsxFactory,
+		JSXFactory:  jsxFactory,
 		JSXFragment: jsxFragment,
 
-		Defines: godefines,
+		Defines:       godefines,
 		PureFunctions: pureFunctions,
 
 		Sourcefile: sourceFile,
-		Loader: api.Loader(loader),
+		Loader:     api.Loader(loader),
 	})
 }
 
