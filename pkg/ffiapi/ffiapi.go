@@ -39,9 +39,11 @@ typedef void* (*allocator) (size_t bytes);
 
 typedef void (*transform_api_callback) (
 	void* cb_data,
-	ffiapi_string js,
+	size_t out_len,
 	ffiapi_message* errors,
-	ffiapi_message* warnings
+	size_t errors_len,
+	ffiapi_message* warnings,
+	size_t warnings_len
 );
 
 static inline ffiapi_string create_ffiapi_string(allocator alloc, _GoString_ gostr) {
@@ -92,9 +94,11 @@ static inline ffiapi_define get_ffiapi_define_array_element(ffiapi_define* array
 static inline void call_transform_api_callback(
 	transform_api_callback f,
 	void* cb_data,
-	ffiapi_string js,
+	size_t out_len,
 	ffiapi_message* errors,
-	ffiapi_message* warnings
+	size_t errors_len,
+	ffiapi_message* warnings,
+	size_t warnings_len
 ) {
 	f(cb_data, js, errors, warnings);
 }
@@ -105,8 +109,9 @@ import (
 	"unsafe"
 )
 
-func copyToCMessageArray(alloc C.allocator, messages []api.Message) *C.ffiapi_message {
-	carray := C.create_ffiapi_message_array(alloc, C.size_t(len(messages)))
+func copyToCMessageArray(alloc C.allocator, messages []api.Message) (*C.ffiapi_message, C.size_t) {
+	clen := C.size_t(len(messages))
+	carray := C.create_ffiapi_message_array(alloc, clen)
 	for i, msg := range messages {
 		C.set_ffiapi_message_array_element(
 			alloc,
@@ -119,23 +124,27 @@ func copyToCMessageArray(alloc C.allocator, messages []api.Message) *C.ffiapi_me
 			C.create_ffiapi_string(alloc, msg.Text),
 		)
 	}
-	return carray
+	return carray, clen
 }
 
 func callTransformApi(
 	alloc C.allocator,
 	cb C.transform_api_callback,
 	cbData unsafe.Pointer,
+	out unsafe.Pointer,
 	code string,
 	transformOptions api.TransformOptions,
 ) {
 	goresult := api.Transform(code, transformOptions)
 
-	cjs := C.create_ffiapi_string_from_bytes(alloc, C.size_t(len(goresult.JS)), unsafe.Pointer(&goresult.JS[0]))
-	cerrors := copyToCMessageArray(alloc, goresult.Errors)
-	cwarnings := copyToCMessageArray(alloc, goresult.Warnings)
+	// TODO Could output be larger than input?
+	coutLen := C.size_t(len(goresult.JS))
+	C.memcpy(out,unsafe.Pointer(&goresult.JS[0]), coutLen)
 
-	C.call_transform_api_callback(cb, cbData, cjs, cerrors, cwarnings)
+	cerrors, cerrorsLen := copyToCMessageArray(alloc, goresult.Errors)
+	cwarnings, cwarningsLen := copyToCMessageArray(alloc, goresult.Warnings)
+
+	C.call_transform_api_callback(cb, cbData, coutLen, cerrors, cerrorsLen, cwarnings, cwarningsLen)
 }
 
 //export GoTransform
@@ -143,6 +152,7 @@ func GoTransform(
 	alloc C.allocator,
 	cb C.transform_api_callback,
 	cbData unsafe.Pointer,
+	out unsafe.Pointer,
 	code string,
 
 	sourceMap C.uint8_t,
@@ -181,7 +191,7 @@ func GoTransform(
 		define := C.get_ffiapi_define_array_element(defines, C.size_t(i))
 		godefines[define.from] = define.to
 	}
-	go callTransformApi(alloc, cb, cbData, code, api.TransformOptions{
+	go callTransformApi(alloc, cb, cbData, out, code, api.TransformOptions{
 		Sourcemap: api.SourceMap(sourceMap),
 		Target: api.Target(target),
 		Engines: goengines,
