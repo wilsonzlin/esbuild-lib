@@ -100,7 +100,7 @@ static inline void call_transform_api_callback(
 	ffiapi_message* warnings,
 	size_t warnings_len
 ) {
-	f(cb_data, js, errors, warnings);
+	f(cb_data, out_len, errors, errors_len, warnings, warnings_len);
 }
 */
 import "C"
