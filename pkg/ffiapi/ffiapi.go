@@ -19,9 +19,9 @@ typedef struct ffiapi_output_file {
 
 typedef struct ffiapi_message {
 	struct ffiapi_string file;
-	int line;
-	int column;
-	int length;
+	ptrdiff_t line;
+	ptrdiff_t column;
+	ptrdiff_t length;
 	struct ffiapi_string text;
 } ffiapi_message;
 
@@ -72,7 +72,7 @@ static inline ffiapi_message* create_ffiapi_message_array(allocator alloc, size_
 	return alloc(sizeof(ffiapi_message) * len);
 }
 
-static inline void set_ffiapi_message_array_element(allocator alloc, ffiapi_message* array, size_t i, ffiapi_string file, int line, int column, int length, ffiapi_string text) {
+static inline void set_ffiapi_message_array_element(allocator alloc, ffiapi_message* array, size_t i, ffiapi_string file, ptrdiff_t line, ptrdiff_t column, ptrdiff_t length, ffiapi_string text) {
 	ffiapi_message msg = {
 		.file = file,
 		.line = line,
@@ -118,9 +118,9 @@ func copyToCMessageArray(alloc C.allocator, messages []api.Message) (*C.ffiapi_m
 			carray,
 			C.size_t(i),
 			C.create_ffiapi_string(alloc, msg.Location.File),
-			C.int(msg.Location.Line),
-			C.int(msg.Location.Column),
-			C.int(msg.Location.Length),
+			C.ptrdiff_t(msg.Location.Line),
+			C.ptrdiff_t(msg.Location.Column),
+			C.ptrdiff_t(msg.Location.Length),
 			C.create_ffiapi_string(alloc, msg.Text),
 		)
 	}
@@ -176,9 +176,9 @@ func GoTransform(
 	sourceFile string,
 	loader C.uint8_t,
 ) {
-	goenginesLen := uint64(enginesLen)
+	goenginesLen := int(enginesLen)
 	goengines := make([]api.Engine, goenginesLen)
-	for i := uint64(0); i < goenginesLen; i++ {
+	for i := 0; i < goenginesLen; i++ {
 		engine := C.get_ffiapi_engine_array_element(engines, C.size_t(i))
 		goengines[i] = api.Engine{
 			Name:    api.EngineName(engine.name),
@@ -186,8 +186,8 @@ func GoTransform(
 		}
 	}
 	godefines := make(map[string]string)
-	godefinesLen := uint64(definesLen)
-	for i := uint64(0); i < godefinesLen; i++ {
+	godefinesLen := int(definesLen)
+	for i := 0; i < godefinesLen; i++ {
 		define := C.get_ffiapi_define_array_element(defines, C.size_t(i))
 		godefines[define.from] = define.to
 	}
