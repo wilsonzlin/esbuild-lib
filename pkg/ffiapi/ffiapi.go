@@ -70,9 +70,7 @@ typedef void (*transform_api_callback) (
 
 //*** Create ffiapi_string functions (interal Go use). ***
 
-static inline ffiapi_string create_ffiapi_string(allocator alloc, _GoString_ gostr) {
-	size_t len = gostr.n;
-	char const* godata = gostr.p;
+static inline ffiapi_string create_ffiapi_string_from_bytes(allocator alloc, size_t len, void const* godata) {
 	char* data = (char*) alloc(len);
 	memcpy(data, godata, len);
 	struct ffiapi_string str = {
@@ -82,14 +80,10 @@ static inline ffiapi_string create_ffiapi_string(allocator alloc, _GoString_ gos
 	return str;
 }
 
-static inline ffiapi_string create_ffiapi_string_from_bytes(allocator alloc, size_t len, void* godata) {
-	char* data = (char*) alloc(len);
-	memcpy(data, godata, len);
-	struct ffiapi_string str = {
-		.len = len,
-		.data = data,
-	};
-	return str;
+static inline ffiapi_string create_ffiapi_string(allocator alloc, _GoString_ gostr) {
+	size_t len = gostr.n;
+	char const* godata = gostr.p;
+	return create_ffiapi_string_from_bytes(alloc, len, godata);
 }
 
 //*** Create ffiapi_message array functions (interal Go use). ***
@@ -98,7 +92,15 @@ static inline ffiapi_message* create_ffiapi_message_array(allocator alloc, size_
 	return alloc(sizeof(ffiapi_message) * len);
 }
 
-static inline void set_ffiapi_message_array_element(ffiapi_message* array, size_t i, ffiapi_string file, ptrdiff_t line, ptrdiff_t column, ptrdiff_t length, ffiapi_string text) {
+static inline void set_ffiapi_message_array_element(
+	ffiapi_message* array,
+	size_t i,
+	ffiapi_string file,
+	ptrdiff_t line,
+	ptrdiff_t column,
+	ptrdiff_t length,
+	ffiapi_string text
+) {
 	ffiapi_message msg = {
 		.file = file,
 		.line = line,
@@ -174,13 +176,17 @@ func copyToCMessageArray(alloc C.allocator, messages []api.Message) (*C.ffiapi_m
 	clen := C.size_t(len(messages))
 	carray := C.create_ffiapi_message_array(alloc, clen)
 	for i, msg := range messages {
+		loc := msg.Location
+		if loc == nil {
+			loc = &api.Location{}
+		}
 		C.set_ffiapi_message_array_element(
 			carray,
 			C.size_t(i),
-			C.create_ffiapi_string(alloc, msg.Location.File),
-			C.ptrdiff_t(msg.Location.Line),
-			C.ptrdiff_t(msg.Location.Column),
-			C.ptrdiff_t(msg.Location.Length),
+			C.create_ffiapi_string(alloc, loc.File),
+			C.ptrdiff_t(loc.Line),
+			C.ptrdiff_t(loc.Column),
+			C.ptrdiff_t(loc.Length),
 			C.create_ffiapi_string(alloc, msg.Text),
 		)
 	}
