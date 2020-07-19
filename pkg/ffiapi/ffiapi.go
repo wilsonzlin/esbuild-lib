@@ -61,7 +61,8 @@ typedef void (*build_api_callback) (
 
 typedef void (*transform_api_callback) (
 	void* cb_data,
-	size_t out_len,
+	ffiapi_string js,
+	ffiapi_string js_source_map,
 	ffiapi_message* errors,
 	size_t errors_len,
 	ffiapi_message* warnings,
@@ -157,7 +158,8 @@ static inline void call_build_api_callback(
 static inline void call_transform_api_callback(
 	transform_api_callback f,
 	void* cb_data,
-	size_t out_len,
+	ffiapi_string js,
+	ffiapi_string js_source_map,
 	ffiapi_message* errors,
 	size_t errors_len,
 	ffiapi_message* warnings,
@@ -171,6 +173,14 @@ import (
 	"github.com/evanw/esbuild/pkg/api"
 	"unsafe"
 )
+
+func copyToCString(alloc C.allocator, bytes []byte) C.ffiapi_string {
+	var godataPtr unsafe.Pointer = nil
+	if len(bytes) > 0 {
+		godataPtr = unsafe.Pointer(&bytes[0])
+	}
+	return C.create_ffiapi_string_from_bytes(alloc, C.size_t(len(bytes)), godataPtr)
+}
 
 func copyToCMessageArray(alloc C.allocator, messages []api.Message) (*C.ffiapi_message, C.size_t) {
 	clen := C.size_t(len(messages))
@@ -201,7 +211,7 @@ func copyToCOutputFileArray(alloc C.allocator, outputFiles []api.OutputFile) (*C
 			carray,
 			C.size_t(i),
 			C.create_ffiapi_string(alloc, file.Path),
-			C.create_ffiapi_string_from_bytes(alloc, C.size_t(len(file.Contents)), unsafe.Pointer(&file.Contents[0])),
+			copyToCString(alloc, file.Contents),
 		)
 	}
 	return carray, clen
@@ -335,20 +345,17 @@ func callTransformApi(
 	alloc C.allocator,
 	cb C.transform_api_callback,
 	cbData unsafe.Pointer,
-	out unsafe.Pointer,
 	code string,
 	transformOptions api.TransformOptions,
 ) {
 	goresult := api.Transform(code, transformOptions)
 
-	// TODO Could output be larger than input?
-	coutLen := C.size_t(len(goresult.JS))
-	C.memcpy(out, unsafe.Pointer(&goresult.JS[0]), coutLen)
-
+	cjs := copyToCString(alloc, goresult.JS)
+	cjsSourceMap := copyToCString(alloc, goresult.JSSourceMap)
 	cerrors, cerrorsLen := copyToCMessageArray(alloc, goresult.Errors)
 	cwarnings, cwarningsLen := copyToCMessageArray(alloc, goresult.Warnings)
 
-	C.call_transform_api_callback(cb, cbData, coutLen, cerrors, cerrorsLen, cwarnings, cwarningsLen)
+	C.call_transform_api_callback(cb, cbData, cjs, cjsSourceMap, cerrors, cerrorsLen, cwarnings, cwarningsLen)
 }
 
 //export GoTransform
@@ -356,7 +363,6 @@ func GoTransform(
 	alloc C.allocator,
 	cb C.transform_api_callback,
 	cbData unsafe.Pointer,
-	out unsafe.Pointer,
 	code string,
 
 	sourceMap C.uint8_t,
@@ -380,7 +386,7 @@ func GoTransform(
 	sourceFile string,
 	loader C.uint8_t,
 ) {
-	go callTransformApi(alloc, cb, cbData, out, code, api.TransformOptions{
+	go callTransformApi(alloc, cb, cbData, code, api.TransformOptions{
 		Sourcemap: api.SourceMap(sourceMap),
 		Target:    api.Target(target),
 		Engines:   convertCEngineArrayToSlice(engines, enginesLen),
