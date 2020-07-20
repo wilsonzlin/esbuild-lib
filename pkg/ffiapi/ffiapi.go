@@ -30,6 +30,14 @@ typedef struct ffiapi_output_file {
 
 //*** Input structs. ***
 
+// WARNING: This must match the GoSlice declaration, including the GoInt type.
+// We can't use GoSlice or GoInt because they are not available in the preamble.
+typedef struct ffiapi_gostring_goslice {
+	_GoString_* data;
+	ptrdiff_t len;
+	ptrdiff_t cap;
+} ffiapi_gostring_goslice;
+
 typedef struct ffiapi_define {
 	_GoString_ from;
 	_GoString_ to;
@@ -44,6 +52,44 @@ typedef struct ffiapi_loader {
 	_GoString_ name;
 	uint8_t loader;
 } ffiapi_loader;
+
+//*** Option structs. ***
+
+typedef struct ffiapi_build_options {
+	uint8_t source_map;
+	uint8_t target;
+	ffiapi_engine* engines;
+	size_t engines_len;
+	bool strict_nullish_coalescing;
+	bool strict_class_fields;
+
+	bool minify_whitespace;
+	bool minify_identifiers;
+	bool minify_syntax;
+
+	_GoString_ jsx_factory;
+	_GoString_ jsx_fragment;
+
+	ffiapi_define* defines;
+	size_t defines_len;
+	ffiapi_gostring_goslice pure_functions;
+
+	_GoString_ global_name;
+	bool bundle;
+	bool splitting;
+	_GoString_ outfile;
+	_GoString_ metafile;
+	_GoString_ outdir;
+	uint8_t platform;
+	uint8_t format;
+	ffiapi_gostring_goslice externals;
+	ffiapi_loader* loaders;
+	size_t loaders_len;
+	ffiapi_gostring_goslice resolve_extensions;
+	_GoString_ tsconfig;
+
+	ffiapi_gostring_goslice entry_points;
+} ffiapi_build_options;
 
 //*** Input functions. ***
 
@@ -126,6 +172,10 @@ import (
 	"github.com/evanw/esbuild/pkg/api"
 	"unsafe"
 )
+
+func asStringSlice(cptr *C.ffiapi_gostring_goslice) []string {
+	return *(*[]string)(unsafe.Pointer(cptr))
+}
 
 func toCString(alloc C.allocator, bytes []byte) C.ffiapi_string {
 	var godataPtr unsafe.Pointer = nil
@@ -220,74 +270,41 @@ func GoBuild(
 	alloc C.allocator,
 	cb C.build_api_callback,
 	cbData unsafe.Pointer,
-
-	sourceMap C.uint8_t,
-	target C.uint8_t,
-	engines *C.ffiapi_engine,
-	enginesLen C.size_t,
-	strictNullishCoalescing C.bool,
-	strictClassFields C.bool,
-
-	minifyWhitespace C.bool,
-	minifyIdentifiers C.bool,
-	minifySyntax C.bool,
-
-	jsxFactory string,
-	jsxFragment string,
-
-	defines *C.ffiapi_define,
-	definesLen C.size_t,
-	pureFunctions []string,
-
-	globalName string,
-	bundle C.bool,
-	splitting C.bool,
-	outfile string,
-	metafile string,
-	outdir string,
-	platform C.uint8_t,
-	format C.uint8_t,
-	externals []string,
-	loaders *C.ffiapi_loader,
-	loadersLen C.size_t,
-	resolveExtensions []string,
-	tsconfig string,
-
-	entryPoints []string,
+	opt *C.ffiapi_build_options,
 ) {
 	go callBuildApi(alloc, cb, cbData, api.BuildOptions{
-		Sourcemap: api.SourceMap(sourceMap),
-		Target:    api.Target(target),
-		Engines:   fromCEngineArray(engines, enginesLen),
+		Sourcemap: api.SourceMap(opt.source_map),
+		Target:    api.Target(opt.target),
+		Engines:   fromCEngineArray(opt.engines, opt.engines_len),
 		Strict: api.StrictOptions{
-			NullishCoalescing: bool(strictNullishCoalescing),
-			ClassFields:       bool(strictClassFields),
+			NullishCoalescing: bool(opt.strict_nullish_coalescing),
+			ClassFields:       bool(opt.strict_class_fields),
 		},
 
-		MinifyWhitespace:  bool(minifyWhitespace),
-		MinifyIdentifiers: bool(minifyIdentifiers),
-		MinifySyntax:      bool(minifySyntax),
+		MinifyWhitespace:  bool(opt.minify_whitespace),
+		MinifyIdentifiers: bool(opt.minify_identifiers),
+		MinifySyntax:      bool(opt.minify_syntax),
 
-		JSXFactory:  jsxFactory,
-		JSXFragment: jsxFragment,
+		JSXFactory:  opt.jsx_factory,
+		JSXFragment: opt.jsx_fragment,
 
-		Defines:       fromCDefineArray(defines, definesLen),
-		PureFunctions: pureFunctions,
+		Defines:       fromCDefineArray(opt.defines, opt.defines_len),
+		PureFunctions: asStringSlice(&opt.pure_functions),
 
-		GlobalName:        globalName,
-		Bundle:            bool(bundle),
-		Splitting:         bool(splitting),
-		Outfile:           outfile,
-		Metafile:          metafile,
-		Outdir:            outdir,
-		Platform:          api.Platform(platform),
-		Format:            api.Format(format),
-		Externals:         externals,
-		Loaders:           fromCLoaderArray(loaders, loadersLen),
-		ResolveExtensions: resolveExtensions,
-		Tsconfig:          tsconfig,
+		GlobalName:        opt.global_name,
+		Bundle:            bool(opt.bundle),
+		Splitting:         bool(opt.splitting),
+		Outfile:           opt.outfile,
+		Metafile:          opt.metafile,
+		Outdir:            opt.outdir,
+		Platform:          api.Platform(opt.platform),
+		Format:            api.Format(opt.format),
+		Externals:         asStringSlice(&opt.externals),
+		Loaders:           fromCLoaderArray(opt.loaders, opt.loaders_len),
+		ResolveExtensions: asStringSlice(&opt.resolve_extensions),
+		Tsconfig:          opt.tsconfig,
 
-		EntryPoints: entryPoints,
+		EntryPoints: asStringSlice(&opt.entry_points),
 	})
 }
 
