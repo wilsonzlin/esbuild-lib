@@ -77,7 +77,9 @@ typedef void (*transform_api_callback) (
 
 static inline ffiapi_string create_ffiapi_string_from_bytes(allocator alloc, size_t len, void const* godata) {
 	char* data = (char*) alloc(len);
-	memcpy(data, godata, len);
+	if (data != NULL && godata != NULL) {
+		memcpy(data, godata, len);
+	}
 	struct ffiapi_string str = {
 		.len = len,
 		.data = data,
