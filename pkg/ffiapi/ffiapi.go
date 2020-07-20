@@ -91,6 +91,29 @@ typedef struct ffiapi_build_options {
 	ffiapi_gostring_goslice entry_points;
 } ffiapi_build_options;
 
+typedef struct ffiapi_transform_options {
+	uint8_t source_map;
+	uint8_t target;
+	ffiapi_engine* engines;
+	size_t engines_len;
+	bool strict_nullish_coalescing;
+	bool strict_class_fields;
+
+	bool minify_whitespace;
+	bool minify_identifiers;
+	bool minify_syntax;
+
+	_GoString_ jsx_factory;
+	_GoString_ jsx_fragment;
+
+	ffiapi_define* defines;
+	size_t defines_len;
+	ffiapi_gostring_goslice pure_functions;
+
+	_GoString_ source_file;
+	uint8_t loader;
+} ffiapi_transform_options;
+
 //*** Input functions. ***
 
 typedef void* (*allocator) (size_t bytes);
@@ -331,49 +354,29 @@ func GoTransform(
 	cb C.transform_api_callback,
 	cbData unsafe.Pointer,
 	code string,
-
-	sourceMap C.uint8_t,
-	target C.uint8_t,
-	engines *C.ffiapi_engine,
-	enginesLen C.size_t,
-	strictNullishCoalescing C.bool,
-	strictClassFields C.bool,
-
-	minifyWhitespace C.bool,
-	minifyIdentifiers C.bool,
-	minifySyntax C.bool,
-
-	jsxFactory string,
-	jsxFragment string,
-
-	defines *C.ffiapi_define,
-	definesLen C.size_t,
-	pureFunctions []string,
-
-	sourceFile string,
-	loader C.uint8_t,
+	opt *C.ffiapi_transform_options,
 ) {
 	go callTransformApi(alloc, cb, cbData, code, api.TransformOptions{
-		Sourcemap: api.SourceMap(sourceMap),
-		Target:    api.Target(target),
-		Engines:   fromCEngineArray(engines, enginesLen),
+		Sourcemap: api.SourceMap(opt.source_map),
+		Target:    api.Target(opt.target),
+		Engines:   fromCEngineArray(opt.engines, opt.engines_len),
 		Strict: api.StrictOptions{
-			NullishCoalescing: bool(strictNullishCoalescing),
-			ClassFields:       bool(strictClassFields),
+			NullishCoalescing: bool(opt.strict_nullish_coalescing),
+			ClassFields:       bool(opt.strict_class_fields),
 		},
 
-		MinifyWhitespace:  bool(minifyWhitespace),
-		MinifyIdentifiers: bool(minifyIdentifiers),
-		MinifySyntax:      bool(minifySyntax),
+		MinifyWhitespace:  bool(opt.minify_whitespace),
+		MinifyIdentifiers: bool(opt.minify_identifiers),
+		MinifySyntax:      bool(opt.minify_syntax),
 
-		JSXFactory:  jsxFactory,
-		JSXFragment: jsxFragment,
+		JSXFactory:  opt.jsx_factory,
+		JSXFragment: opt.jsx_fragment,
 
-		Defines:       fromCDefineArray(defines, definesLen),
-		PureFunctions: pureFunctions,
+		Defines:       fromCDefineArray(opt.defines, opt.defines_len),
+		PureFunctions: asStringSlice(&opt.pure_functions),
 
-		Sourcefile: sourceFile,
-		Loader:     api.Loader(loader),
+		Sourcefile: opt.source_file,
+		Loader:     api.Loader(opt.loader),
 	})
 }
 
