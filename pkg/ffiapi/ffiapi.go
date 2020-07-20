@@ -49,10 +49,6 @@ typedef struct ffiapi_loader {
 
 typedef void* (*allocator) (size_t bytes);
 
-static inline void* call_alloc(allocator alloc, size_t bytes) {
-	return alloc(bytes);
-}
-
 typedef void (*build_api_callback) (
 	void* cb_data,
 	ffiapi_output_file* output_files,
@@ -94,6 +90,10 @@ static inline ffiapi_string create_ffiapi_string(allocator alloc, _GoString_ gos
 }
 
 //*** Call callback functions (interal Go use). ***
+
+static inline void* call_alloc(allocator alloc, size_t bytes) {
+	return alloc(bytes);
+}
 
 static inline void call_build_api_callback(
 	build_api_callback f,
