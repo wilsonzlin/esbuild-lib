@@ -39,8 +39,8 @@ typedef struct ffiapi_gostring_goslice {
 } ffiapi_gostring_goslice;
 
 typedef struct ffiapi_define {
-	_GoString_ from;
-	_GoString_ to;
+	_GoString_ name;
+	_GoString_ value;
 } ffiapi_define;
 
 typedef struct ffiapi_engine {
@@ -243,7 +243,7 @@ func fromCDefineArray(cptr *C.ffiapi_define, clen C.size_t) map[string]string {
 	govalue := make(map[string]string, length)
 	for i := 0; i < length; i++ {
 		define := slice[i]
-		govalue[define.from] = define.to
+		govalue[define.name] = define.value
 	}
 	return govalue
 }
