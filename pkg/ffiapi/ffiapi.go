@@ -38,10 +38,10 @@ typedef struct ffiapi_gostring_goslice {
 	ptrdiff_t cap;
 } ffiapi_gostring_goslice;
 
-typedef struct ffiapi_define {
+typedef struct ffiapi_map_string_string_entry {
 	_GoString_ name;
 	_GoString_ value;
-} ffiapi_define;
+} ffiapi_map_string_string_entry;
 
 typedef struct ffiapi_engine {
 	uint8_t name;
@@ -57,22 +57,26 @@ typedef struct ffiapi_loader {
 
 typedef struct ffiapi_build_options {
 	uint8_t source_map;
+	uint8_t sources_content;
+
 	uint8_t target;
 	ffiapi_engine* engines;
 	size_t engines_len;
-	bool strict_nullish_coalescing;
-	bool strict_class_fields;
 
 	bool minify_whitespace;
 	bool minify_identifiers;
 	bool minify_syntax;
+	uint8_t charset;
+	uint8_t tree_shaking;
 
 	_GoString_ jsx_factory;
 	_GoString_ jsx_fragment;
 
-	ffiapi_define* defines;
-	size_t defines_len;
-	ffiapi_gostring_goslice pure_functions;
+	ffiapi_map_string_string_entry* define;
+	size_t define_len;
+	ffiapi_gostring_goslice pure;
+	bool avoid_tdz;
+	bool keep_names;
 
 	_GoString_ global_name;
 	bool bundle;
@@ -80,15 +84,25 @@ typedef struct ffiapi_build_options {
 	_GoString_ outfile;
 	_GoString_ metafile;
 	_GoString_ outdir;
+	_GoString_ outbase;
 	uint8_t platform;
 	uint8_t format;
-	ffiapi_gostring_goslice externals;
-	ffiapi_loader* loaders;
-	size_t loaders_len;
+	ffiapi_gostring_goslice external;
+	ffiapi_gostring_goslice main_fields;
+	ffiapi_loader* loader;
+	size_t loader_len;
 	ffiapi_gostring_goslice resolve_extensions;
 	_GoString_ tsconfig;
+	ffiapi_map_string_string_entry* out_extensions;
+	size_t out_extensions_len;
+	_GoString_ public_path;
+	ffiapi_gostring_goslice inject;
+	_GoString_ banner;
+	_GoString_ footer;
 
 	ffiapi_gostring_goslice entry_points;
+	bool write;
+	bool incremental;
 } ffiapi_build_options;
 
 typedef struct ffiapi_transform_options {
@@ -113,8 +127,8 @@ typedef struct ffiapi_transform_options {
 	_GoString_ footer;
 	_GoString_ banner;
 
-	ffiapi_define* defines;
-	size_t defines_len;
+	ffiapi_map_string_string_entry* define;
+	size_t define_len;
 	ffiapi_gostring_goslice pure;
 	bool avoid_tdz;
 	bool keep_names;
@@ -246,13 +260,13 @@ func toCOutputFileArray(alloc C.allocator, outputFiles []api.OutputFile) (*C.ffi
 	return carray, clen
 }
 
-func fromCDefineArray(cptr *C.ffiapi_define, clen C.size_t) map[string]string {
+func fromCMapStringStringEntryArray(cptr *C.ffiapi_map_string_string_entry, clen C.size_t) map[string]string {
 	length := int(clen)
-	slice := (*[1 << 30]C.ffiapi_define)(unsafe.Pointer(cptr))[:length:length]
+	slice := (*[1 << 30]C.ffiapi_map_string_string_entry)(unsafe.Pointer(cptr))[:length:length]
 	govalue := make(map[string]string, length)
 	for i := 0; i < length; i++ {
-		define := slice[i]
-		govalue[define.name] = define.value
+		value := slice[i]
+		govalue[value.name] = value.value
 	}
 	return govalue
 }
@@ -305,23 +319,25 @@ func GoBuild(
 	opt *C.ffiapi_build_options,
 ) {
 	go callBuildApi(alloc, cb, cbData, api.BuildOptions{
-		Sourcemap: api.SourceMap(opt.source_map),
-		Target:    api.Target(opt.target),
-		Engines:   fromCEngineArray(opt.engines, opt.engines_len),
-		Strict: api.StrictOptions{
-			NullishCoalescing: bool(opt.strict_nullish_coalescing),
-			ClassFields:       bool(opt.strict_class_fields),
-		},
+		Sourcemap:      api.SourceMap(opt.source_map),
+		SourcesContent: api.SourcesContent(opt.sources_content),
+
+		Target:  api.Target(opt.target),
+		Engines: fromCEngineArray(opt.engines, opt.engines_len),
 
 		MinifyWhitespace:  bool(opt.minify_whitespace),
 		MinifyIdentifiers: bool(opt.minify_identifiers),
 		MinifySyntax:      bool(opt.minify_syntax),
+		Charset:           api.Charset(opt.charset),
+		TreeShaking:       api.TreeShaking(opt.tree_shaking),
 
 		JSXFactory:  opt.jsx_factory,
 		JSXFragment: opt.jsx_fragment,
 
-		Defines:       fromCDefineArray(opt.defines, opt.defines_len),
-		PureFunctions: asStringSlice(&opt.pure_functions),
+		Define:    fromCMapStringStringEntryArray(opt.define, opt.define_len),
+		Pure:      asStringSlice(&opt.pure),
+		AvoidTDZ:  bool(opt.avoid_tdz),
+		KeepNames: bool(opt.keep_names),
 
 		GlobalName:        opt.global_name,
 		Bundle:            bool(opt.bundle),
@@ -329,14 +345,23 @@ func GoBuild(
 		Outfile:           opt.outfile,
 		Metafile:          opt.metafile,
 		Outdir:            opt.outdir,
+		Outbase:           opt.outbase,
 		Platform:          api.Platform(opt.platform),
 		Format:            api.Format(opt.format),
-		Externals:         asStringSlice(&opt.externals),
-		Loaders:           fromCLoaderArray(opt.loaders, opt.loaders_len),
+		External:          asStringSlice(&opt.external),
+		MainFields:        asStringSlice(&opt.main_fields),
+		Loader:            fromCLoaderArray(opt.loader, opt.loader_len),
 		ResolveExtensions: asStringSlice(&opt.resolve_extensions),
 		Tsconfig:          opt.tsconfig,
+		OutExtensions:     fromCMapStringStringEntryArray(opt.out_extensions, opt.out_extensions_len),
+		PublicPath:        opt.public_path,
+		Inject:            asStringSlice(&opt.inject),
+		Banner:            opt.banner,
+		Footer:            opt.footer,
 
 		EntryPoints: asStringSlice(&opt.entry_points),
+		Write:       bool(opt.write),
+		Incremental: bool(opt.incremental),
 	})
 }
 
@@ -386,8 +411,8 @@ func GoTransform(
 		Footer:      opt.footer,
 		Banner:      opt.banner,
 
-		Define:    fromCDefineArray(opt.defines, opt.defines_len),
-		Pure:      asStringSlice(&opt.pure_functions),
+		Define:    fromCMapStringStringEntryArray(opt.define, opt.define_len),
+		Pure:      asStringSlice(&opt.pure),
 		AvoidTDZ:  bool(opt.avoid_tdz),
 		KeepNames: bool(opt.keep_names),
 
