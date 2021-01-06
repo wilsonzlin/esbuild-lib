@@ -3,20 +3,20 @@ package test
 import (
 	"testing"
 
-	"github.com/evanw/esbuild/internal/ast"
-	"github.com/evanw/esbuild/internal/logging"
+	"github.com/evanw/esbuild/internal/logger"
 )
 
 func AssertEqual(t *testing.T, a interface{}, b interface{}) {
+	t.Helper()
 	if a != b {
 		t.Fatalf("%s != %s", a, b)
 	}
 }
 
-func SourceForTest(contents string) logging.Source {
-	return logging.Source{
+func SourceForTest(contents string) logger.Source {
+	return logger.Source{
 		Index:          0,
-		KeyPath:        ast.Path{Text: "<stdin>"},
+		KeyPath:        logger.Path{Text: "<stdin>"},
 		PrettyPath:     "<stdin>",
 		Contents:       contents,
 		IdentifierName: "stdin",

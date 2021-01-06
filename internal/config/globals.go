@@ -5,7 +5,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/evanw/esbuild/internal/ast"
+	"github.com/evanw/esbuild/internal/js_ast"
+	"github.com/evanw/esbuild/internal/logger"
 )
 
 var processedGlobalsMutex sync.Mutex
@@ -111,22 +112,41 @@ var knownGlobals = [][]string{
 	{"Math", "trunc"},
 }
 
-type FindSymbol func(name string) ast.Ref
-type DefineFunc func(FindSymbol) ast.E
+type DefineArgs struct {
+	Loc             logger.Loc
+	FindSymbol      func(logger.Loc, string) js_ast.Ref
+	SymbolForDefine func(int) js_ast.Ref
+}
+
+type DefineFunc func(DefineArgs) js_ast.E
 
 type DefineData struct {
 	DefineFunc DefineFunc
+
+	// True if accessing this value is known to not have any side effects. For
+	// example, a bare reference to "Object.create" can be removed because it
+	// does not have any observable side effects.
+	CanBeRemovedIfUnused bool
 
 	// True if a call to this value is known to not have any side effects. For
 	// example, a bare call to "Object()" can be removed because it does not
 	// have any observable side effects.
 	CallCanBeUnwrappedIfUnused bool
+
+	// Set to true to warn users that this should be defined if it's not already.
+	WarnAboutLackOfDefine bool
 }
 
 func mergeDefineData(old DefineData, new DefineData) DefineData {
+	if old.CanBeRemovedIfUnused {
+		new.CanBeRemovedIfUnused = true
+	}
 	if old.CallCanBeUnwrappedIfUnused {
 		new.CallCanBeUnwrappedIfUnused = true
 	}
+
+	// Don't warn if the user defined this
+	new.WarnAboutLackOfDefine = false
 	return new
 }
 
@@ -170,22 +190,28 @@ func ProcessDefines(userDefines map[string]DefineData) ProcessedDefines {
 	for _, parts := range knownGlobals {
 		tail := parts[len(parts)-1]
 		if len(parts) == 1 {
-			result.IdentifierDefines[tail] = DefineData{}
+			result.IdentifierDefines[tail] = DefineData{CanBeRemovedIfUnused: true}
 		} else {
-			result.DotDefines[tail] = append(result.DotDefines[tail], DotDefine{Parts: parts})
+			result.DotDefines[tail] = append(result.DotDefines[tail], DotDefine{Parts: parts, Data: DefineData{CanBeRemovedIfUnused: true}})
 		}
 	}
 
 	// Swap in certain literal values because those can be constant folded
 	result.IdentifierDefines["undefined"] = DefineData{
-		DefineFunc: func(FindSymbol) ast.E { return &ast.EUndefined{} },
+		DefineFunc: func(DefineArgs) js_ast.E { return &js_ast.EUndefined{} },
 	}
 	result.IdentifierDefines["NaN"] = DefineData{
-		DefineFunc: func(FindSymbol) ast.E { return &ast.ENumber{Value: math.NaN()} },
+		DefineFunc: func(DefineArgs) js_ast.E { return &js_ast.ENumber{Value: math.NaN()} },
 	}
 	result.IdentifierDefines["Infinity"] = DefineData{
-		DefineFunc: func(FindSymbol) ast.E { return &ast.ENumber{Value: math.Inf(1)} },
+		DefineFunc: func(DefineArgs) js_ast.E { return &js_ast.ENumber{Value: math.Inf(1)} },
 	}
+
+	// Warn about use of this without a define
+	result.DotDefines["NODE_ENV"] = []DotDefine{{
+		Parts: []string{"process", "env", "NODE_ENV"},
+		Data:  DefineData{WarnAboutLackOfDefine: true},
+	}}
 
 	// Then copy the user-specified defines in afterwards, which will overwrite
 	// any known globals above.

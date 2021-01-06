@@ -1,7 +1,13 @@
 package config
 
 import (
+	"fmt"
+	"regexp"
+	"sync"
+
 	"github.com/evanw/esbuild/internal/compat"
+	"github.com/evanw/esbuild/internal/js_ast"
+	"github.com/evanw/esbuild/internal/logger"
 )
 
 type LanguageTarget int8
@@ -24,16 +30,6 @@ const (
 )
 
 type StrictOptions struct {
-	// Loose:  "a ?? b" => "a != null ? a : b"
-	// Strict: "a ?? b" => "a !== null && a !== void 0 ? a : b"
-	//
-	// The disadvantage of strictness here is code bloat. The only observable
-	// difference between the two is when the left operand is the bizarre legacy
-	// value "document.all". This value is special-cased in the standard for
-	// legacy reasons such that "document.all != null" is false even though it's
-	// not "null" or "undefined".
-	NullishCoalescing bool
-
 	// Loose:  "class Foo { foo = 1 }" => "class Foo { constructor() { this.foo = 1; } }"
 	// Strict: "class Foo { foo = 1 }" => "class Foo { constructor() { __publicField(this, 'foo', 1); } }"
 	//
@@ -67,7 +63,17 @@ const (
 	LoaderDataURL
 	LoaderFile
 	LoaderBinary
+	LoaderCSS
+	LoaderDefault
 )
+
+func (loader Loader) IsTypeScript() bool {
+	return loader == LoaderTS || loader == LoaderTSX
+}
+
+func (loader Loader) CanHaveSourceMap() bool {
+	return loader == LoaderJS || loader == LoaderJSX || loader == LoaderTS || loader == LoaderTSX
+}
 
 type Format uint8
 
@@ -84,9 +90,9 @@ const (
 	//     ... bundled code ...
 	//   })();
 	//
-	// If the optional ModuleName is configured, then we'll write out this:
+	// If the optional GlobalName is configured, then we'll write out this:
 	//
-	//   let moduleName = (() => {
+	//   let globalName = (() => {
 	//     ... bundled code ...
 	//     return exports;
 	//   })();
@@ -112,6 +118,18 @@ func (f Format) KeepES6ImportExportSyntax() bool {
 	return f == FormatPreserve || f == FormatESModule
 }
 
+func (f Format) String() string {
+	switch f {
+	case FormatIIFE:
+		return "iife"
+	case FormatCommonJS:
+		return "cjs"
+	case FormatESModule:
+		return "esm"
+	}
+	return ""
+}
+
 type StdinInfo struct {
 	Loader        Loader
 	Contents      string
@@ -119,47 +137,215 @@ type StdinInfo struct {
 	AbsResolveDir string
 }
 
+type WildcardPattern struct {
+	Prefix string
+	Suffix string
+}
+
 type ExternalModules struct {
 	NodeModules map[string]bool
 	AbsPaths    map[string]bool
+	Patterns    []WildcardPattern
 }
 
-type Options struct {
-	// true: imports are scanned and bundled along with the file
-	// false: imports are left alone and the file is passed through as-is
-	IsBundling bool
+type Mode uint8
 
+const (
+	ModePassThrough Mode = iota
+	ModeConvertFormat
+	ModeBundle
+)
+
+type Options struct {
+	Mode              Mode
 	RemoveWhitespace  bool
 	MinifyIdentifiers bool
 	MangleSyntax      bool
 	CodeSplitting     bool
 
+	// Setting this to true disables warnings about code that is very likely to
+	// be a bug. This is used to ignore issues inside "node_modules" directories.
+	// This has caught real issues in the past. However, it's not esbuild's job
+	// to find bugs in other libraries, and these warnings are problematic for
+	// people using these libraries with esbuild. The only fix is to either
+	// disable all esbuild warnings and not get warnings about your own code, or
+	// to try to get the warning fixed in the affected library. This is
+	// especially annoying if the warning is a false positive as was the case in
+	// https://github.com/firebase/firebase-js-sdk/issues/3814. So these warnings
+	// are now disabled for code inside "node_modules" directories.
+	SuppressWarningsAboutWeirdCode bool
+
 	// If true, make sure to generate a single file that can be written to stdout
 	WriteToStdout bool
 
-	OmitRuntimeForTests bool
+	OmitRuntimeForTests     bool
+	PreserveUnusedImportsTS bool
+	UseDefineForClassFields bool
+	ASCIIOnly               bool
+	KeepNames               bool
+	IgnoreDCEAnnotations    bool
 
-	Strict   StrictOptions
 	Defines  *ProcessedDefines
 	TS       TSOptions
 	JSX      JSXOptions
 	Platform Platform
 
-	UnsupportedFeatures compat.Feature
+	UnsupportedJSFeatures  compat.JSFeature
+	UnsupportedCSSFeatures compat.CSSFeature
 
 	ExtensionOrder  []string
+	MainFields      []string
 	ExternalModules ExternalModules
 
-	AbsOutputFile     string
-	AbsOutputDir      string
-	ModuleName        string
-	TsConfigOverride  string
-	ExtensionToLoader map[string]Loader
-	OutputFormat      Format
+	AbsOutputFile      string
+	AbsOutputDir       string
+	AbsOutputBase      string
+	OutputExtensionJS  string
+	OutputExtensionCSS string
+	GlobalName         []string
+	TsConfigOverride   string
+	ExtensionToLoader  map[string]Loader
+	OutputFormat       Format
+	PublicPath         string
+	InjectAbsPaths     []string
+	InjectedDefines    []InjectedDefine
+	InjectedFiles      []InjectedFile
+	Banner             string
+	Footer             string
+
+	Plugins []Plugin
 
 	// If present, metadata about the bundle is written as JSON here
 	AbsMetadataFile string
 
-	SourceMap SourceMap
-	Stdin     *StdinInfo
+	SourceMap             SourceMap
+	ExcludeSourcesContent bool
+
+	Stdin *StdinInfo
+}
+
+func IsTreeShakingEnabled(mode Mode, outputFormat Format) bool {
+	return mode == ModeBundle || (mode == ModeConvertFormat && outputFormat == FormatIIFE)
+}
+
+type InjectedDefine struct {
+	Source logger.Source
+	Data   js_ast.E
+	Name   string
+}
+
+type InjectedFile struct {
+	Path        string
+	SourceIndex uint32
+	Exports     []string
+	IsDefine    bool
+}
+
+var filterMutex sync.Mutex
+var filterCache map[string]*regexp.Regexp
+
+func compileFilter(filter string) (result *regexp.Regexp) {
+	if filter == "" {
+		// Must provide a filter
+		return nil
+	}
+	ok := false
+
+	// Cache hit?
+	(func() {
+		filterMutex.Lock()
+		defer filterMutex.Unlock()
+		if filterCache != nil {
+			result, ok = filterCache[filter]
+		}
+	})()
+	if ok {
+		return
+	}
+
+	// Cache miss
+	result, err := regexp.Compile(filter)
+	if err != nil {
+		return nil
+	}
+
+	// Cache for next time
+	filterMutex.Lock()
+	defer filterMutex.Unlock()
+	if filterCache == nil {
+		filterCache = make(map[string]*regexp.Regexp)
+	}
+	filterCache[filter] = result
+	return
+}
+
+func CompileFilterForPlugin(pluginName string, kind string, filter string) (*regexp.Regexp, error) {
+	if filter == "" {
+		return nil, fmt.Errorf("[%s] %q is missing a filter", pluginName, kind)
+	}
+
+	result := compileFilter(filter)
+	if result == nil {
+		return nil, fmt.Errorf("[%s] %q filter is not a valid Go regular expression: %q", pluginName, kind, filter)
+	}
+
+	return result, nil
+}
+
+func PluginAppliesToPath(path logger.Path, filter *regexp.Regexp, namespace string) bool {
+	return (namespace == "" || path.Namespace == namespace) && filter.MatchString(path.Text)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Plugin API
+
+type Plugin struct {
+	Name      string
+	OnResolve []OnResolve
+	OnLoad    []OnLoad
+}
+
+type OnResolve struct {
+	Name      string
+	Filter    *regexp.Regexp
+	Namespace string
+	Callback  func(OnResolveArgs) OnResolveResult
+}
+
+type OnResolveArgs struct {
+	Path       string
+	Importer   logger.Path
+	ResolveDir string
+}
+
+type OnResolveResult struct {
+	PluginName string
+
+	Path     logger.Path
+	External bool
+
+	Msgs        []logger.Msg
+	ThrownError error
+}
+
+type OnLoad struct {
+	Name      string
+	Filter    *regexp.Regexp
+	Namespace string
+	Callback  func(OnLoadArgs) OnLoadResult
+}
+
+type OnLoadArgs struct {
+	Path logger.Path
+}
+
+type OnLoadResult struct {
+	PluginName string
+
+	Contents      *string
+	AbsResolveDir string
+	Loader        Loader
+
+	Msgs        []logger.Msg
+	ThrownError error
 }

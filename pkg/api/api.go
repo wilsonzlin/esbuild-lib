@@ -17,8 +17,7 @@
 //     package main
 //
 //     import (
-//         "fmt"
-//         "io/ioutil"
+//         "os"
 //
 //         "github.com/evanw/esbuild/pkg/api"
 //     )
@@ -73,7 +72,7 @@
 //         fmt.Printf("%d errors and %d warnings\n",
 //             len(result.Errors), len(result.Warnings))
 //
-//         os.Stdout.Write(result.JS)
+//         os.Stdout.Write(result.Code)
 //     }
 //
 package api
@@ -85,6 +84,13 @@ const (
 	SourceMapInline
 	SourceMapLinked
 	SourceMapExternal
+)
+
+type SourcesContent uint8
+
+const (
+	SourcesContentInclude SourcesContent = iota
+	SourcesContentExclude
 )
 
 type Target uint8
@@ -103,7 +109,8 @@ const (
 type Loader uint8
 
 const (
-	LoaderJS Loader = iota
+	LoaderNone Loader = iota
+	LoaderJS
 	LoaderJSX
 	LoaderTS
 	LoaderTSX
@@ -113,6 +120,8 @@ const (
 	LoaderDataURL
 	LoaderFile
 	LoaderBinary
+	LoaderCSS
+	LoaderDefault
 )
 
 type Platform uint8
@@ -148,11 +157,12 @@ type Engine struct {
 }
 
 type Location struct {
-	File     string
-	Line     int // 1-based
-	Column   int // 0-based, in bytes
-	Length   int // in bytes
-	LineText string
+	File      string
+	Namespace string
+	Line      int // 1-based
+	Column    int // 0-based, in bytes
+	Length    int // in bytes
+	LineText  string
 }
 
 type Message struct {
@@ -177,10 +187,20 @@ const (
 	LogLevelError
 )
 
-type StrictOptions struct {
-	NullishCoalescing bool
-	ClassFields       bool
-}
+type Charset uint8
+
+const (
+	CharsetDefault Charset = iota
+	CharsetASCII
+	CharsetUTF8
+)
+
+type TreeShaking uint8
+
+const (
+	TreeShakingDefault TreeShaking = iota
+	TreeShakingIgnoreAnnotations
+)
 
 ////////////////////////////////////////////////////////////////////////////////
 // Build API
@@ -190,20 +210,25 @@ type BuildOptions struct {
 	ErrorLimit int
 	LogLevel   LogLevel
 
-	Sourcemap SourceMap
-	Target    Target
-	Engines   []Engine
-	Strict    StrictOptions
+	Sourcemap      SourceMap
+	SourcesContent SourcesContent
+
+	Target  Target
+	Engines []Engine
 
 	MinifyWhitespace  bool
 	MinifyIdentifiers bool
 	MinifySyntax      bool
+	Charset           Charset
+	TreeShaking       TreeShaking
 
 	JSXFactory  string
 	JSXFragment string
 
-	Defines       map[string]string
-	PureFunctions []string
+	Define    map[string]string
+	Pure      []string
+	AvoidTDZ  bool
+	KeepNames bool
 
 	GlobalName        string
 	Bundle            bool
@@ -211,16 +236,25 @@ type BuildOptions struct {
 	Outfile           string
 	Metafile          string
 	Outdir            string
+	Outbase           string
 	Platform          Platform
 	Format            Format
-	Externals         []string
-	Loaders           map[string]Loader
+	External          []string
+	MainFields        []string
+	Loader            map[string]Loader
 	ResolveExtensions []string
 	Tsconfig          string
+	OutExtensions     map[string]string
+	PublicPath        string
+	Inject            []string
+	Banner            string
+	Footer            string
 
 	EntryPoints []string
 	Stdin       *StdinOptions
 	Write       bool
+	Incremental bool
+	Plugins     []Plugin
 }
 
 type StdinOptions struct {
@@ -235,6 +269,8 @@ type BuildResult struct {
 	Warnings []Message
 
 	OutputFiles []OutputFile
+
+	Rebuild func() BuildResult
 }
 
 type OutputFile struct {
@@ -254,20 +290,30 @@ type TransformOptions struct {
 	ErrorLimit int
 	LogLevel   LogLevel
 
-	Sourcemap SourceMap
-	Target    Target
-	Engines   []Engine
-	Strict    StrictOptions
+	Sourcemap      SourceMap
+	SourcesContent SourcesContent
+
+	Target     Target
+	Format     Format
+	GlobalName string
+	Engines    []Engine
 
 	MinifyWhitespace  bool
 	MinifyIdentifiers bool
 	MinifySyntax      bool
+	Charset           Charset
+	TreeShaking       TreeShaking
 
 	JSXFactory  string
 	JSXFragment string
+	TsconfigRaw string
+	Footer      string
+	Banner      string
 
-	Defines       map[string]string
-	PureFunctions []string
+	Define    map[string]string
+	Pure      []string
+	AvoidTDZ  bool
+	KeepNames bool
 
 	Sourcefile string
 	Loader     Loader
@@ -277,10 +323,95 @@ type TransformResult struct {
 	Errors   []Message
 	Warnings []Message
 
-	JS          []byte
-	JSSourceMap []byte
+	Code []byte
+	Map  []byte
 }
 
 func Transform(input string, options TransformOptions) TransformResult {
 	return transformImpl(input, options)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Serve API
+
+type ServeOptions struct {
+	Port      uint16
+	Host      string
+	OnRequest func(ServeOnRequestArgs)
+}
+
+type ServeOnRequestArgs struct {
+	RemoteAddress string
+	Method        string
+	Path          string
+	Status        int
+	TimeInMS      int // The time to generate the response, not to send it
+}
+
+type ServeResult struct {
+	Port uint16
+	Host string
+	Wait func() error
+	Stop func()
+}
+
+func Serve(serveOptions ServeOptions, buildOptions BuildOptions) (ServeResult, error) {
+	return serveImpl(serveOptions, buildOptions)
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Plugin API
+
+type Plugin struct {
+	Name  string
+	Setup func(PluginBuild)
+}
+
+type PluginBuild interface {
+	OnResolve(options OnResolveOptions, callback func(OnResolveArgs) (OnResolveResult, error))
+	OnLoad(options OnLoadOptions, callback func(OnLoadArgs) (OnLoadResult, error))
+}
+
+type OnResolveOptions struct {
+	Filter    string
+	Namespace string
+}
+
+type OnResolveArgs struct {
+	Path       string
+	Importer   string
+	Namespace  string
+	ResolveDir string
+}
+
+type OnResolveResult struct {
+	PluginName string
+
+	Errors   []Message
+	Warnings []Message
+
+	Path      string
+	External  bool
+	Namespace string
+}
+
+type OnLoadOptions struct {
+	Filter    string
+	Namespace string
+}
+
+type OnLoadArgs struct {
+	Path      string
+	Namespace string
+}
+
+type OnLoadResult struct {
+	PluginName string
+
+	Errors   []Message
+	Warnings []Message
+
+	Contents   *string
+	ResolveDir string
+	Loader     Loader
 }
