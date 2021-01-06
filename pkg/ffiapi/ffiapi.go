@@ -93,22 +93,31 @@ typedef struct ffiapi_build_options {
 
 typedef struct ffiapi_transform_options {
 	uint8_t source_map;
+	uint8_t sources_content;
+
 	uint8_t target;
+	uint8_t format;
+	_GoString_ global_name;
 	ffiapi_engine* engines;
 	size_t engines_len;
-	bool strict_nullish_coalescing;
-	bool strict_class_fields;
 
 	bool minify_whitespace;
 	bool minify_identifiers;
 	bool minify_syntax;
+	uint8_t charset;
+	uint8_t tree_shaking;
 
 	_GoString_ jsx_factory;
 	_GoString_ jsx_fragment;
+	_GoString_ tsconfig_raw;
+	_GoString_ footer;
+	_GoString_ banner;
 
 	ffiapi_define* defines;
 	size_t defines_len;
-	ffiapi_gostring_goslice pure_functions;
+	ffiapi_gostring_goslice pure;
+	bool avoid_tdz;
+	bool keep_names;
 
 	_GoString_ source_file;
 	uint8_t loader;
@@ -130,8 +139,8 @@ typedef void (*build_api_callback) (
 
 typedef void (*transform_api_callback) (
 	void* cb_data,
-	ffiapi_string js,
-	ffiapi_string js_source_map,
+	ffiapi_string code,
+	ffiapi_string map,
 	ffiapi_message* errors,
 	size_t errors_len,
 	ffiapi_message* warnings,
@@ -180,14 +189,14 @@ static inline void call_build_api_callback(
 static inline void call_transform_api_callback(
 	transform_api_callback f,
 	void* cb_data,
-	ffiapi_string js,
-	ffiapi_string js_source_map,
+	ffiapi_string code,
+	ffiapi_string map,
 	ffiapi_message* errors,
 	size_t errors_len,
 	ffiapi_message* warnings,
 	size_t warnings_len
 ) {
-	f(cb_data, js, js_source_map, errors, errors_len, warnings, warnings_len);
+	f(cb_data, code, map, errors, errors_len, warnings, warnings_len);
 }
 */
 import "C"
@@ -340,8 +349,8 @@ func callTransformApi(
 ) {
 	goresult := api.Transform(code, transformOptions)
 
-	cjs := toCString(alloc, goresult.JS)
-	cjsSourceMap := toCString(alloc, goresult.JSSourceMap)
+	cjs := toCString(alloc, goresult.Code)
+	cjsSourceMap := toCString(alloc, goresult.Map)
 	cerrors, cerrorsLen := toCMessageArray(alloc, goresult.Errors)
 	cwarnings, cwarningsLen := toCMessageArray(alloc, goresult.Warnings)
 
@@ -357,23 +366,30 @@ func GoTransform(
 	opt *C.ffiapi_transform_options,
 ) {
 	go callTransformApi(alloc, cb, cbData, code, api.TransformOptions{
-		Sourcemap: api.SourceMap(opt.source_map),
-		Target:    api.Target(opt.target),
-		Engines:   fromCEngineArray(opt.engines, opt.engines_len),
-		Strict: api.StrictOptions{
-			NullishCoalescing: bool(opt.strict_nullish_coalescing),
-			ClassFields:       bool(opt.strict_class_fields),
-		},
+		Sourcemap:      api.SourceMap(opt.source_map),
+		SourcesContent: api.SourcesContent(opt.sources_content),
+
+		Target:     api.Target(opt.target),
+		Format:     api.Format(opt.format),
+		GlobalName: opt.global_name,
+		Engines:    fromCEngineArray(opt.engines, opt.engines_len),
 
 		MinifyWhitespace:  bool(opt.minify_whitespace),
 		MinifyIdentifiers: bool(opt.minify_identifiers),
 		MinifySyntax:      bool(opt.minify_syntax),
+		Charset:           api.Charset(opt.charset),
+		TreeShaking:       api.TreeShaking(opt.tree_shaking),
 
 		JSXFactory:  opt.jsx_factory,
 		JSXFragment: opt.jsx_fragment,
+		TsconfigRaw: opt.tsconfig_raw,
+		Footer:      opt.footer,
+		Banner:      opt.banner,
 
-		Defines:       fromCDefineArray(opt.defines, opt.defines_len),
-		PureFunctions: asStringSlice(&opt.pure_functions),
+		Define:    fromCDefineArray(opt.defines, opt.defines_len),
+		Pure:      asStringSlice(&opt.pure_functions),
+		AvoidTDZ:  bool(opt.avoid_tdz),
+		KeepNames: bool(opt.keep_names),
 
 		Sourcefile: opt.source_file,
 		Loader:     api.Loader(opt.loader),
