@@ -1,7 +1,3 @@
-// +build !darwin
-// +build !freebsd
-// +build !linux
-
 package fs
 
 import (
